@@ -152,3 +152,48 @@ then checks the final nodes, directed relationships, properties and OpenGraph
 exports. These checks exercise
 the local ingestion pipeline; they do not perform live cloud collection or
 establish performance limits for large deployments.
+
+## Validate with an on-premises AD snapshot
+
+For a lab with no Azure or Tailscale collection, the repository includes a
+test-only AD adapter. This exercises the graph query and export paths using
+collected directory objects. It does not add an AD collection command or an AD
+ingestion type to Cirro.
+
+Run the read-only PowerShell snapshot script on a domain controller, or a
+domain-joined host with the ActiveDirectory module and directory read access:
+
+```powershell
+.\tools\collect_ad_snapshot.ps1 | Set-Content -Encoding utf8 ad-snapshot.json
+```
+
+The script emits selected users, groups, computers, OUs, domain identity and
+trust observations. It excludes passwords, descriptions and arbitrary directory
+attributes. Copy the JSON to the machine running Cirro, then run:
+
+```sh
+python3 tools/test_graphqlite_ad.py \
+  --source /absolute/path/ad-snapshot.json \
+  --binary target/release/cirro \
+  --work-dir /absolute/path/new-ad-validation
+```
+
+The adapter uses explicit `ADUser`, `ADGroup`, `ADComputer`, `ADOU` and `ADDomain`
+labels. It resolves direct membership and SID-derived primary group membership,
+preserving booleans, integers and lists. References to objects outside the
+snapshot are reported as unresolved. Trust observations remain in the report;
+foreign domain nodes and trust relationships are not inferred. This is not a
+complete forest, effective-permission or BloodHound collection.
+
+Checks compare the graph with the source, repeat the load, reopen the database,
+exercise scoped `CALL` and `WHEN` branches, and verify both export formats.
+For a comparison against an empty disposable Neo4j instance, set
+`CIRRO_NEO4J_PASSWORD` and add `--neo4j-server bolt://127.0.0.1:17687`.
+The adapter refuses an existing output directory or a nonempty Neo4j database.
+It compares complete graph contents and OpenGraph exports, normalizing internal
+IDs, label order and JSON object key order.
+
+Each run retains the graph, exports and reports under its output directory.
+These files contain directory data and query results; keep them local with the
+source snapshot. The source hash is checked after validation. Collected lab
+snapshots are not included in the repository.
