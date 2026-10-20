@@ -7,6 +7,8 @@ members = ["cargo:."]
 cargo-dist-version = "0.30.2"
 # CI backends to support
 ci = "github"
+# Add embedded GraphQLite archives alongside the existing default releases.
+local-artifacts-jobs = ["./release-graphqlite"]
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)

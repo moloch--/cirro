@@ -1,0 +1,244 @@
+name: GraphQLite release packages
+
+# Also runnable without a tag to validate release archives without publishing.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: false
+        type: string
+        default: '{}'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  targets:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test package verification
+        run: python -m unittest discover -s tools -p 'test_graphqlite_release_unit.py'
+      - id: targets
+        shell: python
+        run: |
+          import json, os, tomllib
+          matrix = [
+              {"target": "aarch64-apple-darwin", "runner": "macos-14", "extension": "dylib"},
+              {"target": "x86_64-apple-darwin", "runner": "macos-15-intel", "extension": "dylib"},
+              {"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "extension": "so"},
+              {"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-22.04", "extension": "so"},
+              {"target": "x86_64-unknown-linux-musl", "runner": "ubuntu-22.04", "extension": "so"},
+              {"target": "x86_64-pc-windows-msvc", "runner": "windows-latest", "extension": "dll"},
+          ]
+          with open("dist-workspace.toml", "rb") as source:
+              targets = tomllib.load(source)["dist"]["targets"]
+          assert sorted(targets) == sorted(row["target"] for row in matrix), "Release target matrices differ"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("matrix=" + json.dumps({"include": matrix}) + "\n")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: graphqlite-release-test-tools
+          path: tools/test_graphqlite_release.py
+          if-no-files-found: error
+
+  build:
+    needs: targets
+    name: Package ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !endsWith(matrix.target, '-musl') }}
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        if: ${{ !endsWith(matrix.target, '-musl') }}
+        with:
+          python-version: '3.12'
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux' && !endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex binutils python3-venv pkg-config libssl-dev cmake
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install bison flex
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: MINGW64
+          update: true
+          path-type: inherit
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-sqlite3
+            mingw-w64-x86_64-libsystre
+            bison
+            flex
+            make
+      - uses: ilammy/setup-nasm@v1
+        if: runner.os == 'Windows'
+      - name: Build native extension
+        if: runner.os != 'Windows' && !endsWith(matrix.target, '-musl')
+        run: |
+          tools/build-graphqlite-extension.sh --target '${{ matrix.target }}' \
+            --output "$PWD/target/release-extension/graphqlite.${{ matrix.extension }}" \
+            --env-file "$GITHUB_ENV"
+      - name: Build Windows extension
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          PYTHON: python
+        run: |
+          tools/build-graphqlite-extension.sh --target '${{ matrix.target }}' \
+            --output "$PWD/target/release-extension/graphqlite.dll"
+          # Retain notices for the statically linked MinGW dependencies.
+          mkdir -p target/release-notices
+          for package in mingw-w64-x86_64-libsystre mingw-w64-x86_64-libtre \
+            mingw-w64-x86_64-gettext-runtime mingw-w64-x86_64-libiconv \
+            mingw-w64-x86_64-gcc-libs mingw-w64-x86_64-sqlite3; do
+            while IFS= read -r notice; do
+              if [[ -f "$notice" ]]; then
+                destination="target/release-notices/${notice#*/share/licenses/}"
+                mkdir -p "$(dirname "$destination")"
+                cp "$notice" "$destination"
+              fi
+            done < <(pacman -Ql "$package" | awk '$2 ~ /\/share\/licenses\// {print $2}')
+          done
+      - name: Build GraphQLite CLI
+        if: ${{ !endsWith(matrix.target, '-musl') }}
+        run: |
+          export CIRRO_GRAPHQLITE_EXTENSION="$PWD/target/release-extension/graphqlite.${{ matrix.extension }}"
+          if [[ '${{ runner.os }}' == Windows ]]; then
+            export CIRRO_GRAPHQLITE_EXTENSION="$(cygpath -w "$CIRRO_GRAPHQLITE_EXTENSION")"
+            export RUSTFLAGS="-C target-feature=+crt-static"
+          fi
+          cargo build --locked --profile dist --features graphqlite --target '${{ matrix.target }}'
+      - name: Package native CLI
+        if: ${{ !endsWith(matrix.target, '-musl') }}
+        run: |
+          executable=cirro
+          notices=()
+          if [[ '${{ runner.os }}' == Windows ]]; then
+            executable=cirro.exe
+            notices=(--notices-dir target/release-notices)
+          fi
+          python tools/package-graphqlite-release.py \
+            --target '${{ matrix.target }}' \
+            --binary "target/${{ matrix.target }}/dist/$executable" \
+            --extension "target/release-extension/graphqlite.${{ matrix.extension }}" \
+            --output-dir target/graphqlite-release "${notices[@]}"
+      - name: Build and package Alpine CLI
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e CARGO_TARGET_DIR=/work/target/alpine \
+            rust:1.94-alpine3.23 sh -euxc '
+              apk add --no-cache bash build-base bison flex python3 py3-pip python3-dev git binutils cmake perl linux-headers openssl-dev openssl-libs-static pkgconf
+              git config --global --add safe.directory /work
+              bash tools/build-graphqlite-extension.sh --target x86_64-unknown-linux-musl \
+                --output /work/target/release-extension/graphqlite.so
+              export CIRRO_GRAPHQLITE_EXTENSION=/work/target/release-extension/graphqlite.so
+              # A static musl executable cannot load a SQLite extension with dlopen.
+              export RUSTFLAGS="-C target-feature=-crt-static"
+              cargo build --locked --profile dist --features graphqlite --target x86_64-unknown-linux-musl
+              python3 tools/package-graphqlite-release.py \
+                --target x86_64-unknown-linux-musl \
+                --binary target/alpine/x86_64-unknown-linux-musl/dist/cirro \
+                --extension target/release-extension/graphqlite.so \
+                --output-dir target/graphqlite-release
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          # cargo-dist's host job downloads artifacts-* and attaches every file.
+          name: artifacts-graphqlite-${{ matrix.target }}
+          path: target/graphqlite-release/*
+          if-no-files-found: error
+
+  verify:
+    needs: [targets, build]
+    name: Verify archive ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      # Deliberately no checkout, compiler setup, or extension installation.
+      - uses: actions/download-artifact@v4
+        with:
+          name: artifacts-graphqlite-${{ matrix.target }}
+          path: package
+      - uses: actions/download-artifact@v4
+        with:
+          name: graphqlite-release-test-tools
+          path: smoke
+      - uses: actions/setup-python@v5
+        if: ${{ !endsWith(matrix.target, '-musl') }}
+        with:
+          python-version: '3.12'
+      - name: Run packaged CLI in isolation
+        if: ${{ !endsWith(matrix.target, '-musl') }}
+        shell: bash
+        run: |
+          archive=(package/*.tar.xz package/*.zip)
+          for file in "${archive[@]}"; do
+            if [[ -f "$file" ]]; then
+              python smoke/test_graphqlite_release.py --archive "$file" \
+                --expected-target '${{ matrix.target }}' --expected-revision '${{ github.sha }}' \
+                --work-dir "$RUNNER_TEMP/packaged-cirro"
+            fi
+          done
+      - name: Run Alpine package with only runtime dependencies
+        if: endsWith(matrix.target, '-musl')
+        shell: bash
+        run: |
+          mkdir extracted
+          tar -xJf package/cirro-graphqlite-x86_64-unknown-linux-musl.tar.xz -C extracted
+          # Check before Python installs any additional runtime libraries.
+          docker run --rm -v "$PWD/extracted:/package:ro" -w /tmp alpine:3.23 sh -euxc '
+            cli=/package/cirro-graphqlite-x86_64-unknown-linux-musl/cirro
+            "$cli" --version
+            touch graph.db
+            "$cli" graph query --backend graphqlite --graph-file graph.db \
+              --cypher "RETURN 1 AS ready" > result.json
+            grep -E "\"ready\":[[:space:]]*1" result.json
+          '
+          docker run --rm -v "$PWD/package:/package:ro" -v "$PWD/smoke:/smoke:ro" \
+            -v "$RUNNER_TEMP:/results" -e EXPECTED_REVISION='${{ github.sha }}' alpine:3.23 sh -euxc '
+              apk add --no-cache python3
+              python3 /smoke/test_graphqlite_release.py \
+                --archive /package/cirro-graphqlite-x86_64-unknown-linux-musl.tar.xz \
+                --expected-target x86_64-unknown-linux-musl --expected-revision "$EXPECTED_REVISION" \
+                --work-dir /results/packaged-cirro
+            '
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: graphqlite-release-verification-${{ matrix.target }}
+          path: ${{ runner.temp }}/packaged-cirro/report.json
+          if-no-files-found: error

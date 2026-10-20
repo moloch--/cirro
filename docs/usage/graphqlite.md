@@ -5,6 +5,35 @@ backend, and ordinary builds retain the existing Neo4j behavior. Enable the
 `graphqlite` Cargo feature when building a binary that also supports local graphs.
 Collection commands and source data formats are unchanged.
 
+## Release packages
+
+Download a `cirro-graphqlite-<target>.tar.xz` archive (or `.zip` on Windows) from
+the [fork's releases](https://github.com/moloch--/cirro/releases). Extract it and
+place `cirro` or `cirro.exe` on your PATH. These packages include all default
+features plus GraphQLite. The extension is embedded in the executable; there is
+no separate extension installation or database server to configure. Neo4j
+remains the default backend, so select `--backend graphqlite` for local graphs.
+
+The archives include both licenses, a SHA-256 checksum alongside the download,
+and `build-info.json` recording the Cirro and GraphQLite revisions and binary
+and embedded-extension hashes. The original `cirro-<target>` packages and their
+installers continue to provide the default-feature build.
+
+GraphQLite packages cover the same six release targets: macOS Intel and Apple
+Silicon, Linux GNU x86-64 and ARM64, Linux musl x86-64, and Windows x86-64.
+GNU builds require the system libraries provided by Ubuntu 22.04 or newer
+(x86-64), or Ubuntu 24.04 or newer (ARM64). The musl package is built for
+Alpine 3.23 and uses its system musl loader, `/lib/ld-musl-x86_64.so.1`, because
+loading an extension requires dynamic linking. The original musl package
+remains static. Windows packages include the extension's non-system
+dependencies statically. All platforms need a writable temporary directory
+that permits loading shared libraries.
+
+The release workflow tests each downloaded archive on a fresh runner, with
+no checkout or GraphQLite installation, before allowing release publication.
+The **GraphQLite release packages** workflow can also be run manually to build
+and validate archives without creating a tag or publishing a release.
+
 ## Build
 
 The build helper fetches the pinned GraphQLite fork, builds its native extension,
