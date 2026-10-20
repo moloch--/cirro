@@ -13,6 +13,7 @@ Example:
 Optional parity requires an EMPTY disposable Neo4j database and its password in
 CIRRO_NEO4J_PASSWORD. Cirro currently accepts that password only as a child CLI
 argument; this script never records credentials or command arguments.
+Use --neo4j-binary to compare a separately built default-feature Cirro binary.
 """
 from __future__ import annotations
 
@@ -56,6 +57,72 @@ def encoded(value):
 def sha256(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def result_rows(rows, ordered):
+    """Compare a row sequence or multiset without changing values inside rows."""
+    values = [encoded(row) for row in rows]
+    return values if ordered else sorted(values)
+
+
+def compare_query_traces(graphqlite, neo4j):
+    """Pair every query by position and require identical inputs and semantics."""
+    left, right = graphqlite["queries"], neo4j["queries"]
+    entries = []
+    for index in range(max(len(left), len(right))):
+        a = left[index] if index < len(left) else None
+        b = right[index] if index < len(right) else None
+        if a is None or b is None:
+            entries.append({"position": index + 1, "name": (a or b)["name"],
+                            "match": False, "error": "Query is missing from one backend trace"})
+            continue
+        metadata = ("name", "cypher", "params_sha256", "ordered", "comparison")
+        same_input = all(a[key] == b[key] for key in metadata)
+        canonical = a["comparison"] == b["comparison"] == "canonical_graph"
+        ddl = a["comparison"] == b["comparison"] == "schema_ddl"
+        if canonical:
+            # These are the same canonical node/edge rows used by snapshot().
+            # Only internal transport IDs and label ordering are normalized.
+            a_rows, b_rows = a["canonical_results"], b["canonical_results"]
+        else:
+            a_rows = result_rows(a["results"], a["ordered"])
+            b_rows = result_rows(b["results"], b["ordered"])
+        same_results = a_rows == b_rows
+        operation_match = (a.get("success") is True and b.get("success") is True) if ddl else same_results
+        entries.append({
+            "position": index + 1, "name": a["name"], "cypher": a["cypher"],
+            "params_sha256": a["params_sha256"],
+            "neo4j_params_sha256": b["params_sha256"],
+            "comparison": a["comparison"],
+            "order_policy": ("schema DDL success; acknowledgement payloads disclosed separately" if ddl else
+                             "canonical graph rows, internal IDs and label order normalized" if canonical else
+                             "exact ordered rows" if a["ordered"] else "unordered row multiset"),
+            "inputs_match": same_input,
+            "graphqlite_rows": len(a["results"]), "neo4j_rows": len(b["results"]),
+            "graphqlite_results_sha256": hashlib.sha256(encoded(a_rows).encode()).hexdigest(),
+            "neo4j_results_sha256": hashlib.sha256(encoded(b_rows).encode()).hexdigest(),
+            "match": same_input and operation_match,
+            "strict_results_match": same_input and same_results,
+            **({"graphqlite_results": a["results"], "neo4j_results": b["results"],
+                "graphqlite_success": a.get("success"), "neo4j_success": b.get("success"),
+                "policy": "Schema DDL returns no Cypher data rows. Compare execution success; disclose acknowledgement differences without treating them as data parity."} if ddl else
+               {} if canonical else {"graphqlite_sample": a["results"][:3], "neo4j_sample": b["results"][:3]}),
+        })
+    return {
+        "passed": len(left) == len(right) and all(entry["match"] for entry in entries),
+        "strict_result_parity": len(left) == len(right) and all(entry.get("strict_results_match", False) for entry in entries),
+        "data_result_parity": len(left) == len(right) and all(entry["match"] for entry in entries
+                                                              if entry.get("comparison") != "schema_ddl"),
+        "ddl_acknowledgement_parity": all(entry["strict_results_match"] for entry in entries
+                                         if entry.get("comparison") == "schema_ddl"),
+        "graphqlite_binary_sha256": graphqlite["binary_sha256"],
+        "neo4j_binary_sha256": neo4j["binary_sha256"],
+        "graphqlite_query_count": len(left), "neo4j_query_count": len(right),
+        "direct_query_count": sum(entry.get("comparison") == "direct" for entry in entries),
+        "canonical_graph_query_count": sum(entry.get("comparison") == "canonical_graph" for entry in entries),
+        "schema_ddl_query_count": sum(entry.get("comparison") == "schema_ddl" for entry in entries),
+        "queries": entries,
+    }
 
 
 def batches(rows, max_bytes=60000):
@@ -185,6 +252,7 @@ def normalize_snapshot(data):
 class ADValidation:
     def __init__(self, args, directory, model, backend="graphqlite"):
         self.args, self.directory, self.model, self.backend = args, directory, model, backend
+        self.binary = args.neo4j_binary if backend == "neo4j" and args.neo4j_binary else args.binary
         self.graph = directory / "graph.db"
         self.commands = 0
         self.report = {"backend": backend, "passed": False, "checks": [], "queries": [],
@@ -192,7 +260,7 @@ class ADValidation:
                        "comparison_normalization": ["Internal graph IDs", "Label order", "JSON object key order"],
                        "source": {"path": str(args.source), "sha256": sha256(args.source),
                                   "bytes": args.source.stat().st_size},
-                       "binary_sha256": sha256(args.binary), "input_counts": model["counts"],
+                       "binary": str(self.binary), "binary_sha256": sha256(self.binary), "input_counts": model["counts"],
                        "source_metadata": model["source_metadata"],
                        "unresolved_references": model["unresolved_references"],
                        "trust_observations": model["trusts"], "trust_note": model["trust_note"]}
@@ -216,7 +284,7 @@ class ADValidation:
     def command(self, arguments):
         self.commands += 1
         try:
-            process = subprocess.run([str(self.args.binary), "graph", *arguments, *self.connection()],
+            process = subprocess.run([str(self.binary), "graph", *arguments, *self.connection()],
                                      cwd=ROOT, text=True, capture_output=True, timeout=self.args.timeout)
         except subprocess.TimeoutExpired:
             # TimeoutExpired includes all argv in its default string, including
@@ -233,10 +301,15 @@ class ADValidation:
         require(process.returncode == 0, "CLI command %d failed; see %s" % (self.commands, log))
         return process.stdout
 
-    def query(self, name, cypher, params=None):
-        rows = json.loads(self.command(["query", "--cypher", cypher, "--params", encoded(params or {})]))
+    def query(self, name, cypher, params=None, *, ordered=False, comparison="direct"):
+        # This fixed query catalog explicitly marks top-level ORDER BY queries.
+        # Nested expressions and list values never inherit row-order treatment.
+        parameters = encoded(params or {})
+        rows = json.loads(self.command(["query", "--cypher", cypher, "--params", parameters]))
         require(isinstance(rows, list), name + " did not return rows")
-        self.report["queries"].append({"name": name, "cypher": cypher, "results": rows})
+        self.report["queries"].append({"name": name, "cypher": cypher,
+                                       "params_sha256": hashlib.sha256(parameters.encode()).hexdigest(),
+                                       "ordered": ordered, "comparison": comparison, "success": True, "results": rows})
         return rows
 
     def check(self, name, condition):
@@ -262,14 +335,18 @@ class ADValidation:
 
     def snapshot(self):
         nodes = self.query("complete node snapshot",
-                           "MATCH (n) RETURN id(n) AS internal, labels(n) AS labels, properties(n) AS properties")
+                           "MATCH (n) RETURN id(n) AS internal, labels(n) AS labels, properties(n) AS properties",
+                           comparison="canonical_graph")
         edges = self.query("complete relationship snapshot",
-                           "MATCH (a)-[r]->(b) RETURN id(a) AS source, id(b) AS target, type(r) AS kind, properties(r) AS properties")
+                           "MATCH (a)-[r]->(b) RETURN id(a) AS source, id(b) AS target, type(r) AS kind, properties(r) AS properties",
+                           comparison="canonical_graph")
         keys = {node["internal"]: encoded([sorted(node["labels"]), node["properties"]]) for node in nodes}
         self.check("internal node identities are unique", len(keys) == len(nodes))
         value = [sorted(keys.values()),
                  sorted(encoded([keys[edge["source"]], edge["kind"], keys[edge["target"]], edge["properties"]])
                         for edge in edges)]
+        self.report["queries"][-2]["canonical_results"] = value[0]
+        self.report["queries"][-1]["canonical_results"] = value[1]
         return value
 
     def validate_source_model(self):
@@ -285,7 +362,7 @@ class ADValidation:
         self.check("all directed relationships exactly match resolved source facts", snapshot[1] == expected_edges)
         memberships = self.query("direct and primary group memberships",
             "MATCH (a:ADObject)-[r:MEMBER_OF]->(g:ADGroup) RETURN a.id AS source, g.id AS target, "
-            "r.explicit AS explicit, r.primary AS primary ORDER BY source, target")
+            "r.explicit AS explicit, r.primary AS primary ORDER BY source, target", ordered=True)
         expected = [{"source": edge["source"], "target": edge["target"], **edge["properties"]}
                     for edge in self.model["edges"] if edge["kind"] == "MEMBER_OF"]
         self.check("direct and primary memberships have exact endpoints and boolean flags",
@@ -374,17 +451,65 @@ class ADValidation:
                     break
         rows = self.query("users reaching Domain Admins within five membership hops",
             "MATCH (u:ADUser)-[:MEMBER_OF*1..5]->(g:ADGroup) WHERE g.name = $group "
-            "RETURN DISTINCT u.samAccountName AS account ORDER BY account", {"group": "Domain Admins"})
+            "RETURN DISTINCT u.samAccountName AS account ORDER BY account", {"group": "Domain Admins"}, ordered=True)
         expected = [{"account": account} for account in accounts]
         self.check("bounded Domain Admins membership paths match independent source traversal",
                    sorted(map(encoded, rows)) == sorted(map(encoded, expected)))
+        rows = self.query("group direct-member counts including empty groups",
+            "MATCH (g:ADGroup) OPTIONAL MATCH (m:ADObject)-[:MEMBER_OF]->(g) "
+            "RETURN g.id AS groupId, count(m) AS directMembers ORDER BY groupId", ordered=True)
+        expected = [{"groupId": node["id"],
+                     "directMembers": sum(edge["target"] == node["id"] for edge in memberships)}
+                    for node in sorted(self.model["nodes"], key=lambda item: item["id"])
+                    if node["label"] == "ADGroup"]
+        self.check("OPTIONAL MATCH aggregation retains empty groups with zero members", encoded(rows) == encoded(expected))
+
+        # Cypher variable-length paths are trails: a relationship may not be
+        # reused, but a vertex can be revisited. Count each distinct trail.
+        path_counts = {}
+        def visit(user_id, current, depth, used_edges):
+            if depth and current in targets:
+                key = (user_id, depth)
+                path_counts[key] = path_counts.get(key, 0) + 1
+            if depth == 5:
+                return
+            for target in adjacency.get(current, ()):
+                edge = (current, target)
+                if edge not in used_edges:
+                    visit(user_id, target, depth + 1, used_edges | {edge})
+        for node in self.model["nodes"]:
+            if node["label"] == "ADUser":
+                visit(node["id"], node["id"], 0, set())
+        rows = self.query("Domain Admins membership path multiplicity",
+            "MATCH p=(u:ADUser)-[:MEMBER_OF*1..5]->(g:ADGroup) WHERE g.name=$group "
+            "RETURN u.id AS userId, length(p) AS hops, count(*) AS paths ORDER BY userId,hops",
+            {"group": "Domain Admins"}, ordered=True)
+        expected = [{"userId": user, "hops": hops, "paths": count}
+                    for (user, hops), count in sorted(path_counts.items())]
+        self.check("path multiplicity and lengths match independent source trail enumeration", encoded(rows) == encoded(expected))
+
+        rows = self.query("ordered collection of each user's direct group IDs",
+            "MATCH (u:ADUser)-[:MEMBER_OF]->(g:ADGroup) WITH u,g ORDER BY u.id,g.id "
+            "RETURN u.id AS userId,collect(g.id) AS groups ORDER BY userId", ordered=True)
+        expected = [{"userId": node["id"], "groups": sorted(adjacency[node["id"]])}
+                    for node in sorted(self.model["nodes"], key=lambda item: item["id"])
+                    if node["label"] == "ADUser" and adjacency.get(node["id"])]
+        self.check("ordered collect preserves source-derived group list order", encoded(rows) == encoded(expected))
+
+        rows = self.query("stable ordered object pagination",
+            "MATCH (n:ADObject) RETURN n.id AS id,n.name AS name ORDER BY name,id SKIP $skip LIMIT $limit",
+            {"skip": 3, "limit": 7}, ordered=True)
+        ordered_nodes = sorted(self.model["nodes"], key=lambda node: (node["properties"]["name"], node["id"]))
+        expected = [{"id": node["id"], "name": node["properties"]["name"]} for node in ordered_nodes[3:10]]
+        self.check("ordered SKIP and LIMIT return the exact source-derived page", encoded(rows) == encoded(expected))
 
     def execute(self):
         start = time.monotonic()
         self.check("target graph starts empty",
                    self.query("empty target guard", "MATCH (n) RETURN count(n) AS count") == [{"count": 0}])
         self.query("AD identity constraint",
-                   "CREATE CONSTRAINT ad_object_identity IF NOT EXISTS FOR (n:ADObject) REQUIRE n.id IS UNIQUE")
+                   "CREATE CONSTRAINT ad_object_identity IF NOT EXISTS FOR (n:ADObject) REQUIRE n.id IS UNIQUE",
+                   comparison="schema_ddl")
         self.load()
         before = self.validate_source_model()
         self.named_queries()
@@ -422,6 +547,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True, help="Read-only schema-version-1 AD snapshot JSON")
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/cirro")
+    parser.add_argument("--neo4j-binary", type=Path, help="Separate default-feature Cirro binary for the Neo4j baseline")
     parser.add_argument("--extension", type=Path, help="Optional development extension override")
     parser.add_argument("--work-dir", type=Path, help="New, nonexistent output directory")
     parser.add_argument("--neo4j-server", help="Optional EMPTY disposable Neo4j baseline")
@@ -429,13 +555,14 @@ def main():
     parser.add_argument("--neo4j-password-env", default="CIRRO_NEO4J_PASSWORD")
     parser.add_argument("--timeout", type=int, default=180)
     args = parser.parse_args()
-    for name in ("source", "binary", "extension"):
+    for name in ("source", "binary", "neo4j_binary", "extension"):
         value = getattr(args, name)
         if value:
             setattr(args, name, value.resolve(strict=True))
             require(getattr(args, name).is_file(), name + " must be a file")
     if args.neo4j_server:
         require(bool(os.environ.get(args.neo4j_password_env)), "Neo4j password environment variable is missing")
+    require(not args.neo4j_binary or args.neo4j_server, "--neo4j-binary requires --neo4j-server")
     source_hash = sha256(args.source)
     model = normalize_snapshot(json.loads(args.source.read_text(encoding="utf-8-sig")))
     directory = args.work_dir.resolve() if args.work_dir else Path(tempfile.mkdtemp(prefix="cirro-ad-validation-"))
@@ -443,6 +570,7 @@ def main():
         directory.mkdir(parents=True, exist_ok=False)
     tests = []
     error = None
+    parity = None
     try:
         for engine in ["graphqlite"] + (["neo4j"] if args.neo4j_server else []):
             output = directory / engine
@@ -451,6 +579,10 @@ def main():
             tests.append(test)
             test.execute()
         if len(tests) == 2:
+            parity = compare_query_traces(tests[0].report, tests[1].report)
+            (directory / "query-parity.json").write_text(json.dumps(parity, indent=2) + "\n")
+            tests[0].check("paired data-result queries match typed results and identical schema DDL succeeds",
+                           parity["passed"])
             tests[0].check("GraphQLite and Neo4j canonical graph snapshots match",
                            tests[0].report["snapshot_sha256"] == tests[1].report["snapshot_sha256"])
             tests[0].check("GraphQLite and Neo4j OpenGraph exports match",
@@ -473,6 +605,14 @@ def main():
               "trust_observations": len(model["trusts"]),
               "backends": [{"backend": test.backend, "report": str(test.directory / "report.json"),
                             "passed": test.report["passed"]} for test in tests]}
+    if parity is not None:
+        report["query_parity"] = {"path": str(directory / "query-parity.json"), "passed": parity["passed"],
+                                  "strict_result_parity": parity["strict_result_parity"],
+                                  "data_result_parity": parity["data_result_parity"],
+                                  "ddl_acknowledgement_parity": parity["ddl_acknowledgement_parity"],
+                                  "direct_queries": parity["direct_query_count"],
+                                  "canonical_graph_queries": parity["canonical_graph_query_count"],
+                                  "schema_ddl_queries": parity["schema_ddl_query_count"]}
     if error:
         report["error"] = error
     (directory / "report.json").write_text(json.dumps(report, indent=2) + "\n")

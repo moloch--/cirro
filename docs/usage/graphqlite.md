@@ -193,6 +193,32 @@ The adapter refuses an existing output directory or a nonempty Neo4j database.
 It compares complete graph contents and OpenGraph exports, normalizing internal
 IDs, label order and JSON object key order.
 
+To use a separate Cirro binary built with only its default features on the
+Neo4j side:
+
+```sh
+CARGO_TARGET_DIR=target/neo4j-comparison cargo build --locked --release
+
+python3 tools/test_graphqlite_ad.py \
+  --source /absolute/path/ad-snapshot.json \
+  --binary target/release/cirro \
+  --neo4j-binary target/neo4j-comparison/release/cirro \
+  --neo4j-server bolt://127.0.0.1:17687 \
+  --work-dir /absolute/path/new-query-comparison
+```
+
+Set `CIRRO_NEO4J_PASSWORD` before running the comparison. Both binaries receive
+identical Cypher and parameters. `query-parity.json` records the input and result
+hashes for each paired execution. Data results preserve scalar types, duplicate
+rows and list order; top-level row order is compared when the query specifies
+`ORDER BY`. Snapshot queries compare graph identities semantically because
+internal node IDs differ between engines.
+
+Schema operation acknowledgments are reported separately: GraphQLite currently
+returns a zero-valued mutation-statistics row for `CREATE CONSTRAINT`, while
+Neo4j returns no rows. The report records this difference rather than treating
+the raw results as identical.
+
 Each run retains the graph, exports and reports under its output directory.
 These files contain directory data and query results; keep them local with the
 source snapshot. The source hash is checked after validation. Collected lab
