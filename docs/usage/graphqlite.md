@@ -1,0 +1,154 @@
+# Optional GraphQLite backend
+
+GraphQLite stores Cirro's graph in a local SQLite file. Neo4j remains the default
+backend, and ordinary builds retain the existing Neo4j behavior. Enable the
+`graphqlite` Cargo feature when building a binary that also supports local graphs.
+Collection commands and source data formats are unchanged.
+
+## Build
+
+The build helper fetches the pinned GraphQLite fork, builds its native extension,
+and embeds it in the Cirro binary:
+
+```sh
+tools/build-graphqlite.sh
+```
+
+This requires Rust, Git, Python, a C compiler, Bison and Flex. On macOS, install
+Homebrew Bison and Flex; the helper puts Homebrew Bison on the build path. The
+helper creates an isolated Python environment for `angreal` when needed.
+
+If the pinned native extension is already built, use it directly:
+
+```sh
+CIRRO_GRAPHQLITE_EXTENSION=/absolute/path/graphqlite.dylib \
+  cargo build --release --features graphqlite
+```
+
+Use a `.so` extension on Linux. The native library must match the target operating
+system and architecture. The resulting binary includes it and extracts it to a
+private temporary directory when opening a GraphQLite connection; users do not
+need a separate extension file. `--graphqlite-extension PATH` overrides the
+embedded library for development.
+
+The fork implements the Cypher constructs and APOC subset used by Cirro's
+templates. It is not a complete Neo4j or APOC implementation. In particular,
+`apoc.periodic.iterate` runs sequentially in one atomic SQLite transaction, even
+when a template requests parallel batches. Its regular expression helpers use
+POSIX expressions. See the
+[fork's compatibility reference](https://github.com/moloch--/graphqlite/blob/b59a6dab054cb75a71d500a7a243f3fd399c8eec/docs/src/content/docs/reference/apoc-compatibility.md)
+for the supported subset.
+
+## Import, query and export
+
+Keep the collected source database and output graph at different paths:
+
+```sh
+cirro graph ingest --backend graphqlite --graph-file analysis.db \
+  --type az --file collected-azure.db
+
+cirro graph ingest --backend graphqlite --graph-file analysis.db \
+  --type ts-status --file tailscale-status.json
+```
+
+The existing ingestion specifications, label filters and postprocessing run
+against the selected backend. Preview an import without creating or changing a
+graph, or run only postprocessing:
+
+```sh
+cirro graph ingest --backend graphqlite --graph-file analysis.db \
+  --type az --file collected-azure.db --dry-run
+
+cirro graph ingest --backend graphqlite --graph-file analysis.db \
+  --type az --file collected-azure.db --post-process
+```
+
+Query the graph using Cypher and JSON parameters. Results are written as JSON:
+
+```sh
+cirro graph query --backend graphqlite --graph-file analysis.db \
+  --cypher 'MATCH (u:GraphUser)-[:MEMBER_OF]->(g:GraphGroup) RETURN u.displayName AS user, g.displayName AS group'
+
+cirro graph query --backend graphqlite --graph-file analysis.db \
+  --cypher 'MATCH (u:GraphUser {id:$id}) RETURN properties(u) AS properties' \
+  --params '{"id":"user-id"}'
+
+cirro graph query --backend graphqlite --graph-file analysis.db \
+  --cypher 'MATCH (t:TSUser)-[:SAME_USER]->(u:GraphUser) RETURN t.loginName AS tailscale, u.userPrincipalName AS azure'
+```
+
+Both existing export formats are available:
+
+```sh
+cirro graph export --backend graphqlite --graph-file analysis.db \
+  --format opengraph --output graph.json
+
+cirro graph export --backend graphqlite --graph-file analysis.db \
+  --format grass --output graph
+```
+
+The second command writes `graph.grass`. OpenGraph exports preserve graph entity
+IDs for relationship endpoints; these internal IDs are separate from each
+resource's `id` property.
+
+## Reproduce the end-to-end checks
+
+The repository does not include collected cloud datasets. The test harness
+generates **synthetic** Azure collector SQLite and Tailscale status JSON inputs,
+then invokes the actual Cirro CLI for ingestion, queries, postprocessing and
+both exports:
+
+```sh
+python3 tools/test_graphqlite_e2e.py --binary target/release/cirro
+```
+
+Add `--pagination-rows 2501` to verify the 2,500-row import batch boundary with
+a separate synthetic source and graph. This checks the total, first, boundary
+and last users; it is a correctness check, not a performance benchmark.
+
+It uses a fresh temporary directory and prints the path to `report.json`.
+The directory retains source fixtures, output graphs, exports and command logs
+for inspection. The report contains source schemas and counts, hashes, executed
+queries and check names. It does not include query-result property values.
+
+Checks cover user/group membership, manager direction, Tailscale identity links,
+nested network relationships, dynamic role types and properties, serialized VM
+settings, vault version parents, node and edge deduplication, label filtering,
+file persistence, repeated-import idempotence and dry-run behavior. They also
+check that ingestion cannot use its source as the graph, and that exporting
+cannot overwrite the graph, including through hardlinks and symbolic links.
+Source hashes must remain unchanged throughout the run.
+
+To exercise an existing collection, supply one or both source options. The
+harness reads the sources and writes a separate graph in a new output directory:
+
+```sh
+python3 tools/test_graphqlite_e2e.py --binary target/release/cirro \
+  --azure-source /absolute/path/collected-azure.db \
+  --tailscale-source /absolute/path/tailscale-status.json \
+  --work-dir /absolute/path/new-test-output
+```
+
+Supplied datasets run import, persistence, idempotence, dry-run, postprocessing
+and export checks. Fixture-specific expectations and injected duplicate test
+nodes are limited to synthetic runs. Exported files contain the imported data,
+so keep the output directory with the source collection.
+
+For a backend comparison, point the harness at a disposable, empty Neo4j instance
+with APOC enabled. It refuses to ingest into a nonempty baseline:
+
+```sh
+python3 tools/test_graphqlite_e2e.py --binary target/release/cirro \
+  --neo4j-server bolt://127.0.0.1:17687 \
+  --neo4j-user neo4j --neo4j-password TEST_PASSWORD
+```
+
+The comparison normalizes internal node IDs, label order and JSON object ordering
+inside the serialized `VMExtension.settings` string. The injected duplicate
+fixture's `E2E_OWNS.source` provenance values are sorted because its Cypher
+`collect` has no defined order. Other property types and list order are preserved.
+The report compares the imported graph before adding that fixture separately,
+then checks the final nodes, directed relationships, properties and OpenGraph
+exports. These checks exercise
+the local ingestion pipeline; they do not perform live cloud collection or
+establish performance limits for large deployments.

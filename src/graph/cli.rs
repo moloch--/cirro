@@ -1,94 +1,184 @@
-use crate::errors::*;
+use crate::errors::CirroError;
+use crate::graph::backend::{GraphBackend, GraphConnectionConfig};
 use crate::graph::export::exporter::CirroExporter;
 use crate::graph::export::types::ExportFormat;
 use crate::graph::ingest::ingestor::{CirroIngestor, IngestType};
-use crate::graph::logger::setup_logger;
+use crate::graph::logger::{setup_logger, setup_query_logger};
+use clap::{Args, Subcommand, ValueEnum};
+use serde_json::{Map, Value};
+use std::path::{Path, PathBuf};
 
-use clap::Subcommand;
-use std::path::PathBuf;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum BackendKind {
+    #[default]
+    Neo4j,
+    #[cfg(feature = "graphqlite")]
+    Graphqlite,
+}
+
+#[derive(Debug, Args)]
+pub struct GraphConnectionArgs {
+    /// Graph database backend
+    #[arg(long, value_enum, default_value_t = BackendKind::Neo4j)]
+    backend: BackendKind,
+    /// Neo4j server URL
+    #[arg(short, long, default_value = "bolt://localhost:7687")]
+    server: String,
+    /// Neo4j user
+    #[arg(short, long, default_value = "neo4j")]
+    user: String,
+    /// Neo4j password
+    #[arg(short, long, default_value = "password")]
+    password: String,
+    /// Neo4j database name (default: neo4j)
+    #[arg(short, long, value_name = "NAME")]
+    db_name: Option<String>,
+    /// GraphQLite graph database, separate from the collected input file
+    #[cfg(feature = "graphqlite")]
+    #[arg(long, value_name = "PATH")]
+    graph_file: Option<PathBuf>,
+    /// Override the bundled GraphQLite native extension
+    #[cfg(feature = "graphqlite")]
+    #[arg(long, value_name = "PATH")]
+    graphqlite_extension: Option<PathBuf>,
+}
+
+impl GraphConnectionArgs {
+    async fn connect(self, create: bool, dry_run: bool) -> Result<GraphBackend, CirroError> {
+        #[cfg(not(feature = "graphqlite"))]
+        let _ = (create, dry_run);
+        let config = match self.backend {
+            BackendKind::Neo4j => {
+                #[cfg(feature = "graphqlite")]
+                if self.graph_file.is_some() || self.graphqlite_extension.is_some() {
+                    return Err(CirroError::Config(
+                        "--graph-file and --graphqlite-extension require --backend graphqlite"
+                            .into(),
+                    ));
+                }
+                if ![
+                    "bolt://",
+                    "bolt+s://",
+                    "bolt+ssc://",
+                    "neo4j://",
+                    "neo4j+s://",
+                    "neo4j+ssc://",
+                ]
+                .iter()
+                .any(|prefix| self.server.starts_with(prefix))
+                {
+                    return Err(CirroError::Config(
+                        "Neo4j server must use a bolt:// or neo4j:// scheme (including +s or +ssc)"
+                            .into(),
+                    ));
+                }
+                GraphConnectionConfig::Neo4j {
+                    host: self.server,
+                    user: self.user,
+                    password: self.password,
+                    db_name: self.db_name,
+                }
+            }
+            #[cfg(feature = "graphqlite")]
+            BackendKind::Graphqlite => {
+                let path = if dry_run {
+                    PathBuf::from(":memory:")
+                } else {
+                    let path = self.graph_file.ok_or_else(|| {
+                        CirroError::Config(
+                            "--graph-file is required for --backend graphqlite".into(),
+                        )
+                    })?;
+                    if !create && !path.is_file() {
+                        return Err(CirroError::Config(format!(
+                            "Graph database does not exist: {}",
+                            path.display()
+                        )));
+                    }
+                    path
+                };
+                GraphConnectionConfig::Graphqlite {
+                    path,
+                    extension_path: self.graphqlite_extension,
+                }
+            }
+        };
+        GraphBackend::connect(config).await
+    }
+
+    fn check_input(&self, input: &Path) -> Result<(), CirroError> {
+        if !input.exists() {
+            return Ok(());
+        }
+        #[cfg(not(feature = "graphqlite"))]
+        let _ = input;
+        #[cfg(feature = "graphqlite")]
+        if self.backend == BackendKind::Graphqlite {
+            if let Some(output) = &self.graph_file {
+                if output.exists() {
+                    let mut same = input.canonicalize()? == output.canonicalize()?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        let source = std::fs::metadata(input)?;
+                        let target = std::fs::metadata(output)?;
+                        same |= source.dev() == target.dev() && source.ino() == target.ino();
+                    }
+                    if same {
+                        return Err(CirroError::Config(
+                            "--graph-file must be separate from input and export files".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Subcommand)]
 pub enum GraphCommands {
-    /// Ingest data into the database
+    /// Ingest collected data into the graph
     Ingest {
-        /// Type of data to ingest
         #[arg(short, long, value_enum)]
         r#type: IngestType,
-
-        /// File to ingest
         #[arg(short, long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
         file: PathBuf,
-
-        /// Database server. Possible schemes: bolt, bolt+s, bolt+ssc, neo4j, neo4j+s, neo4j+ssc
-        #[arg(
-            short,
-            long,
-            value_name = "SERVER",
-            default_value = "bolt://localhost:7687"
-        )]
-        server: String,
-
-        /// Database user
-        #[arg(short, long, value_name = "USER", default_value = "neo4j")]
-        user: String,
-
-        /// Database password
-        #[arg(short, long, value_name = "PASSWORD", default_value = "password")]
-        password: String,
-
-        /// Database name. Defaults to "neo4j".
-        #[arg(short, long, value_name = "NAME")]
-        db_name: Option<String>,
-
-        /// Ingest only these nodes (comma-separated list of labels). Useful for testing or partial ingestions.
+        #[command(flatten)]
+        connection: GraphConnectionArgs,
+        /// Ingest only these labels (comma-separated)
         #[arg(long, value_name = "LABELS", value_delimiter = ',', num_args = 1..)]
         labels: Option<Vec<String>>,
-
         /// Run only post-processing specs
-        #[arg(long, action = clap::ArgAction::SetTrue)]
+        #[arg(long)]
         post_process: bool,
-
-        /// Show what would be ingested and post-processed without executing queries
-        #[arg(long, action = clap::ArgAction::SetTrue)]
+        /// Show ingestion and post-processing without changing the graph
+        #[arg(long)]
         dry_run: bool,
-
-        /// Enable debug logging
-        #[arg(long, action = clap::ArgAction::SetTrue)]
+        #[arg(long)]
         debug: bool,
     },
-    /// Export database in different formats
+    /// Export the graph in different formats
     Export {
-        /// Format to export
         #[arg(short, long, value_name = "FORMAT")]
         format: ExportFormat,
-
-        /// Output file path (default: ./cirro_export)
-        #[arg(short, long, value_name = "OUTPUT", default_value = "cirro_export", value_hint = clap::ValueHint::FilePath)]
+        #[arg(short, long, default_value = "cirro_export", value_hint = clap::ValueHint::FilePath)]
         output: PathBuf,
-
-        /// Database server. Possible schemes: bolt, bolt+s, bolt+ssc, neo4j, neo4j+s, neo4j+ssc
-        #[arg(
-            short,
-            long,
-            value_name = "SERVER",
-            default_value = "bolt://localhost:7687"
-        )]
-        server: String,
-
-        /// Database user
-        #[arg(short, long, value_name = "USER", default_value = "neo4j")]
-        user: String,
-
-        /// Database password
-        #[arg(short, long, value_name = "PASSWORD", default_value = "password")]
-        password: String,
-
-        /// Database name. Defaults to "neo4j".
-        #[arg(short, long, value_name = "NAME")]
-        db_name: Option<String>,
-
-        /// Enable debug logging
-        #[arg(long, action = clap::ArgAction::SetTrue)]
+        #[command(flatten)]
+        connection: GraphConnectionArgs,
+        #[arg(long)]
+        debug: bool,
+    },
+    /// Execute Cypher and print rows as JSON
+    Query {
+        #[arg(short = 'q', long, visible_alias = "query")]
+        cypher: String,
+        /// JSON object containing Cypher parameters
+        #[arg(long, default_value = "{}")]
+        params: String,
+        #[command(flatten)]
+        connection: GraphConnectionArgs,
+        #[arg(long)]
         debug: bool,
     },
 }
@@ -98,95 +188,54 @@ pub async fn handle_graph_command(command: GraphCommands) -> Result<(), CirroErr
         GraphCommands::Ingest {
             r#type,
             file,
-            server,
-            user,
-            password,
-            db_name,
+            connection,
             labels,
             post_process,
             dry_run,
             debug,
         } => {
-            if let Err(e) = setup_logger(debug) {
-                return Err(CirroError::Unknown(e.to_string()));
-            }
-
-            // Validate the file exists and is readable
-            if !file.exists() {
-                return Err(CirroError::Unknown(format!(
-                    "File does not exist: {}",
-                    file.display()
-                )));
-            }
+            setup_logger(debug)?;
             if !file.is_file() {
-                return Err(CirroError::Unknown(format!(
-                    "Path is not a file: {}",
+                return Err(CirroError::Config(format!(
+                    "Input file does not exist: {}",
                     file.display()
                 )));
             }
-            // Check if file is readable by attempting to open it
-            std::fs::File::open(&file).map_err(|e| {
-                CirroError::Unknown(format!("File is not readable: {} - {}", file.display(), e))
-            })?;
-
-            // Validate the database host
-            if !server.starts_with("bolt://")
-                && !server.starts_with("bolt+s://")
-                && !server.starts_with("bolt+ssc://")
-                && !server.starts_with("neo4j://")
-                && !server.starts_with("neo4j+s://")
-                && !server.starts_with("neo4j+ssc://")
-            {
-                return Err(CirroError::Unknown(
-            "Database host must start with bolt://, bolt+s://, bolt+ssc://, neo4j://, neo4j+s://, or neo4j+ssc://".into(),
-        ));
-            }
-
-            // Create the ingestor
-            let mut ingestor =
-                CirroIngestor::new(r#type, file, server, user, password, db_name, labels).await;
-
-            // Run the ingestor
-            if let Err(e) = ingestor.run(post_process, dry_run).await {
-                return Err(CirroError::Unknown(e.to_string()));
-            }
+            std::fs::File::open(&file)?;
+            connection.check_input(&file)?;
+            let backend = connection.connect(true, dry_run).await?;
+            CirroIngestor::new(r#type, file, labels, backend)?
+                .run(post_process, dry_run)
+                .await?;
         }
-
         GraphCommands::Export {
             format,
             output,
-            server,
-            user,
-            password,
-            db_name,
+            connection,
             debug,
         } => {
-            if let Err(e) = setup_logger(debug) {
-                return Err(CirroError::Unknown(e.to_string()));
-            }
-            // Validate the database host
-            if !server.starts_with("bolt://")
-                && !server.starts_with("bolt+s://")
-                && !server.starts_with("bolt+ssc://")
-                && !server.starts_with("neo4j://")
-                && !server.starts_with("neo4j+s://")
-                && !server.starts_with("neo4j+ssc://")
-            {
-                return Err(CirroError::Unknown(
-                    "Database host must start with bolt://, bolt+s://, bolt+ssc://, neo4j://, neo4j+s://, or neo4j+ssc://".into(),
-                ));
-            }
-
-            // Create the exporter
-            let mut exporter =
-                CirroExporter::new(format, output, server, user, password, db_name).await;
-
-            // Run the exporter
-            if let Err(e) = exporter.run().await {
-                return Err(CirroError::Unknown(e.to_string()));
-            }
+            setup_logger(debug)?;
+            let export_path = match format {
+                ExportFormat::Opengraph => output.clone(),
+                ExportFormat::Grass => output.with_extension("grass"),
+            };
+            connection.check_input(&export_path)?;
+            let backend = connection.connect(false, false).await?;
+            CirroExporter::new(format, output, backend).run().await?;
+        }
+        GraphCommands::Query {
+            cypher,
+            params,
+            connection,
+            debug,
+        } => {
+            setup_query_logger(debug)?;
+            let params: Map<String, Value> = serde_json::from_str(&params)
+                .map_err(|e| CirroError::Config(format!("--params must be a JSON object: {e}")))?;
+            let backend = connection.connect(false, false).await?;
+            let rows = backend.query_rows(&cypher, params).await?;
+            println!("{}", serde_json::to_string_pretty(&rows)?);
         }
     }
-
     Ok(())
 }

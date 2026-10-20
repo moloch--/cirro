@@ -54,3 +54,4 @@ neo4j/
 site/
 *.csv
 demo/
+__pycache__/

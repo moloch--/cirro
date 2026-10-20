@@ -1,8 +1,7 @@
 use crate::errors::CirroError;
 use crate::graph::ingest::ingestor::CirroIngestor;
 use log::{debug, info};
-use neo4rs::{BoltType, query};
-use serde_json;
+use serde_json::Map;
 
 impl CirroIngestor {
     /// Process ingest
@@ -24,8 +23,6 @@ impl CirroIngestor {
         let json_data: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
             CirroError::InvalidData(format!("Failed to parse Tailscale status JSON data: {}", e))
         })?;
-
-        let bolt_data = BoltType::try_from(json_data)?;
 
         // Process the Tailscale Status spec
         // Status could be written in one spec, but multiple specs are used for modularity
@@ -52,9 +49,10 @@ impl CirroIngestor {
                 continue;
             }
 
-            let mut result = self
+            let params = Map::from_iter([("status_data".to_string(), json_data.clone())]);
+            let count = self
                 .graph
-                .execute(query(&spec.cypher).param("status_data", bolt_data.clone()))
+                .query_count(&spec.cypher, params, "count")
                 .await
                 .map_err(|e| {
                     CirroError::DatabaseError(format!(
@@ -62,21 +60,6 @@ impl CirroIngestor {
                         e
                     ))
                 })?;
-
-            // There is only row returned with count
-            let row = result.next().await.map_err(|e| {
-                CirroError::DatabaseError(format!(
-                    "Error retrieving row from Tailscale status ingest query: {}",
-                    e
-                ))
-            })?;
-
-            let count: i64 = row.unwrap().get("count").map_err(|e| {
-                CirroError::DatabaseError(format!(
-                    "Failed to convert count to i64 in Tailscale status ingest query result: {}",
-                    e
-                ))
-            })?;
 
             info!("Processed {:>5} : {}", count, spec.name);
         }
@@ -88,24 +71,9 @@ impl CirroIngestor {
 
         // Ensure all Tailscale ingestion transactions are committed
         debug!("Finalizing Tailscale ingestion transactions...");
-        let mut final_txn = self.graph.start_txn().await.map_err(|e| {
+        self.graph.finalize().await.map_err(|e| {
             CirroError::DatabaseError(format!(
-                "Failed to start Tailscale finalization transaction: {}",
-                e
-            ))
-        })?;
-        final_txn
-            .run(neo4rs::query("RETURN 1"))
-            .await
-            .map_err(|e| {
-                CirroError::DatabaseError(format!(
-                    "Failed to execute Tailscale finalization query: {}",
-                    e
-                ))
-            })?;
-        final_txn.commit().await.map_err(|e| {
-            CirroError::DatabaseError(format!(
-                "Failed to commit Tailscale finalization transaction: {}",
+                "Failed to finalize Tailscale ingestion transactions: {}",
                 e
             ))
         })?;

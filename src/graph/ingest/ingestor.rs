@@ -1,10 +1,11 @@
 use crate::errors::CirroError;
+use crate::graph::backend::GraphBackend;
 use crate::graph::ingest::CREATE_CONSTRAINT_QUERY;
 use crate::graph::specs::{SpecLoader, SpecRegistry, SpecTrait};
 use clap::ValueEnum;
 use log::{debug, info};
-use neo4rs::*;
 use rusqlite::{Connection, Result};
+use serde_json::Map;
 use std::path::PathBuf;
 use tokio::time::Duration;
 
@@ -19,12 +20,8 @@ pub enum IngestType {
 pub struct CirroIngestor {
     pub r#type: IngestType,
     pub file: PathBuf,
-    pub host: String,
-    pub user: String,
-    pub password: String,
-    pub db_name: String,
     pub labels: Option<Vec<String>>,
-    pub graph: neo4rs::Graph,
+    pub graph: GraphBackend,
     pub sql_conn: Option<Connection>,
     pub specs: SpecRegistry,
 }
@@ -35,77 +32,37 @@ impl std::fmt::Debug for CirroIngestor {
         f.debug_struct("CirroIngestor")
             .field("type", &self.r#type)
             .field("file", &self.file)
-            .field("host", &self.host)
-            .field("user", &self.user)
-            .field("password", &self.password)
-            .field("db_name", &self.db_name)
-            .field("graph", &format_args!("<neo4rs::Graph>"))
+            .field("graph", &format_args!("<GraphBackend>"))
             .field("specs", &format_args!("<SpecRegistry>"))
             .finish()
     }
 }
 
 impl CirroIngestor {
-    pub async fn new(
+    pub fn new(
         r#type: IngestType,
         file: PathBuf,
-        host: String,
-        user: String,
-        password: String,
-        db_name: Option<String>,
         labels: Option<Vec<String>>,
-    ) -> Self {
-        // Load all specs first before database connection
+        graph: GraphBackend,
+    ) -> Result<Self, CirroError> {
         info!("Loading ingestion specifications...");
+        let specs = SpecLoader::load_all_specs_filtered(labels.clone())?;
+        let sql_conn = match r#type {
+            IngestType::Az => Some(Connection::open_with_flags(
+                &file,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?),
+            IngestType::TsStatus => None,
+        };
 
-        let specs = SpecLoader::load_all_specs_filtered(labels.clone())
-            .map_err(|e| {
-                panic!("Failed to load specs: {}", e);
-            })
-            .unwrap();
-
-        // If db_name is not provided, use the default
-        let db_name = db_name.unwrap_or_else(|| "neo4j".to_string());
-
-        let config = ConfigBuilder::default()
-            .uri(host.clone())
-            .user(user.clone())
-            .password(password.clone())
-            .db(db_name.clone())
-            .build()
-            .map_err(|e| CirroError::DatabaseError(e.to_string()))
-            .unwrap();
-
-        info!("Connecting to database at {} with user {}", host, user);
-        let graph = Graph::connect(config)
-            .await
-            .map_err(|e| CirroError::DatabaseError(e.to_string()))
-            .unwrap();
-
-        // Test connection to the database
-        let mut result = graph.execute(query("RETURN 1")).await.unwrap();
-        let row = result.next().await.unwrap().unwrap();
-        let value: i64 = row.get("1").unwrap();
-        assert_eq!(1, value);
-        info!("Successfully connected to the database");
-
-        let sql_conn = Connection::open(file.clone())
-            .map_err(|e| CirroError::DatabaseError(e.to_string()))
-            .ok();
-
-        let ingestor = CirroIngestor {
+        Ok(CirroIngestor {
             r#type,
-            file: file,
-            host,
-            user,
-            password,
-            db_name,
+            file,
             graph,
             sql_conn,
             specs,
             labels,
-        };
-        return ingestor;
+        })
     }
 
     /// Runs the ingestor
@@ -153,7 +110,7 @@ impl CirroIngestor {
         debug!("Executing query: {}", constraint_query);
         let _ = self
             .graph
-            .run(query(&constraint_query))
+            .run(&constraint_query, Map::new())
             .await
             .map_err(|e| {
                 CirroError::DatabaseError(format!(
@@ -179,14 +136,8 @@ impl CirroIngestor {
     /// Ensures all transactions are committed before proceeding
     async fn finalize_transactions(&self) -> Result<(), CirroError> {
         info!("Finalizing all transactions...");
-        let mut final_txn = self.graph.start_txn().await.map_err(|e| {
-            CirroError::DatabaseError(format!("Failed to start finalization transaction: {}", e))
-        })?;
-        final_txn.run(query("RETURN 1")).await.map_err(|e| {
-            CirroError::DatabaseError(format!("Failed to execute finalization query: {}", e))
-        })?; // Dummy query to ensure transaction context
-        final_txn.commit().await.map_err(|e| {
-            CirroError::DatabaseError(format!("Failed to commit finalization transaction: {}", e))
+        self.graph.finalize().await.map_err(|e| {
+            CirroError::DatabaseError(format!("Failed to finalize ingestion transactions: {}", e))
         })?;
 
         // Add a brief pause to ensure commit propagation
@@ -215,7 +166,11 @@ impl CirroIngestor {
         // Force a transaction commit by running a simple query that requires a read
         let _ = self
             .graph
-            .execute(query("MATCH (n) RETURN count(n) LIMIT 1"))
+            .query_count(
+                "MATCH (n) RETURN count(n) AS count LIMIT 1",
+                Map::new(),
+                "count",
+            )
             .await
             .map_err(|e| {
                 CirroError::DatabaseError(format!("Failed to execute commit check query: {}", e))
@@ -233,12 +188,15 @@ impl CirroIngestor {
         for spec in &post_processing_specs {
             debug!("Running post-processing spec: {}", spec.name);
 
-            self.graph.run(query(&spec.cypher)).await.map_err(|e| {
-                CirroError::DatabaseError(format!(
-                    "Failed to execute post-processing query for spec {}: {}",
-                    spec.name, e
-                ))
-            })?;
+            self.graph
+                .run(&spec.cypher, Map::new())
+                .await
+                .map_err(|e| {
+                    CirroError::DatabaseError(format!(
+                        "Failed to execute post-processing query for spec {}: {}",
+                        spec.name, e
+                    ))
+                })?;
         }
 
         Ok(())

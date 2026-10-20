@@ -1,10 +1,10 @@
 use crate::errors::CirroError;
+use crate::graph::backend::GraphBackend;
 use crate::graph::ingest::CREATE_CONSTRAINT_QUERY;
 use crate::graph::ingest::ingestor::CirroIngestor;
 use crate::graph::specs::CirroAzureIngestSpec;
 use log::{debug, info, warn};
-use neo4rs::{BoltType, query};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
@@ -53,24 +53,9 @@ impl CirroIngestor {
 
         // Ensure all Azure ingestion transactions are committed
         debug!("Finalizing Azure ingestion transactions...");
-        let mut final_txn = self.graph.start_txn().await.map_err(|e| {
+        self.graph.finalize().await.map_err(|e| {
             CirroError::DatabaseError(format!(
-                "Failed to start Azure finalization transaction: {}",
-                e
-            ))
-        })?;
-        final_txn
-            .run(neo4rs::query("RETURN 1"))
-            .await
-            .map_err(|e| {
-                CirroError::DatabaseError(format!(
-                    "Failed to execute Azure finalization query: {}",
-                    e
-                ))
-            })?;
-        final_txn.commit().await.map_err(|e| {
-            CirroError::DatabaseError(format!(
-                "Failed to commit Azure finalization transaction: {}",
+                "Failed to finalize Azure ingestion transactions: {}",
                 e
             ))
         })?;
@@ -141,10 +126,10 @@ impl CirroIngestor {
     }
 }
 
-/// Process a single spec with its own SQLite connection and pipelined Neo4j writes
+/// Process a single spec with its own SQLite connection and batched graph writes
 async fn process_spec(
     sql_file: &PathBuf,
-    graph: &neo4rs::Graph,
+    graph: &GraphBackend,
     spec: &CirroAzureIngestSpec,
     dry_run: bool,
 ) -> Result<(), CirroError> {
@@ -368,11 +353,11 @@ async fn process_spec(
             last_rowid
         );
 
-        // Write batch to Neo4j
+        // Write the same parameterized batch to either graph backend.
         let batch_len = processed_values.len();
-        let bolt_batch = BoltType::try_from(Value::Array(processed_values))?;
+        let params = Map::from_iter([("batch".to_string(), Value::Array(processed_values))]);
         graph
-            .run(query(&spec.cypher).param("batch", bolt_batch))
+            .run(&spec.cypher, params)
             .await
             .map_err(|e| CirroError::DatabaseError(e.to_string()))?;
 
@@ -382,7 +367,7 @@ async fn process_spec(
 }
 
 /// Create default constraints for base labels
-async fn create_default_constraints_and_indexes(graph: &neo4rs::Graph) -> Result<(), CirroError> {
+async fn create_default_constraints_and_indexes(graph: &GraphBackend) -> Result<(), CirroError> {
     for label in ["ArmResource", "GraphObject"] {
         create_constraint(graph, label, "id").await?;
     }
@@ -416,7 +401,7 @@ fn parse_label_properties(entry: &str) -> Option<(&str, Vec<String>)> {
 }
 
 async fn create_constraint_for_properties(
-    graph: &neo4rs::Graph,
+    graph: &GraphBackend,
     label_name: &str,
     properties: &[String],
 ) -> Result<(), CirroError> {
@@ -435,20 +420,23 @@ async fn create_constraint_for_properties(
         label_name, pattern
     );
     debug!("Executing query: {}", constraint_query);
-    graph.run(query(&constraint_query)).await.map_err(|e| {
-        CirroError::DatabaseError(format!(
-            "Failed to create composite constraint for {}.({}): {}",
-            label_name,
-            properties.join(", "),
-            e
-        ))
-    })?;
+    graph
+        .run(&constraint_query, Map::new())
+        .await
+        .map_err(|e| {
+            CirroError::DatabaseError(format!(
+                "Failed to create composite constraint for {}.({}): {}",
+                label_name,
+                properties.join(", "),
+                e
+            ))
+        })?;
 
     Ok(())
 }
 
 async fn create_index_for_properties(
-    graph: &neo4rs::Graph,
+    graph: &GraphBackend,
     label_name: &str,
     properties: &[String],
 ) -> Result<(), CirroError> {
@@ -476,7 +464,7 @@ async fn create_index_for_properties(
         query_name, label_name, pattern
     );
     debug!("Executing query: {}", index_query);
-    graph.run(query(&index_query)).await.map_err(|e| {
+    graph.run(&index_query, Map::new()).await.map_err(|e| {
         CirroError::DatabaseError(format!(
             "Failed to create composite index for {}.({}): {}",
             label_name,
@@ -490,7 +478,7 @@ async fn create_index_for_properties(
 
 /// Create an index on a label's property (idempotent via IF NOT EXISTS)
 async fn create_index(
-    graph: &neo4rs::Graph,
+    graph: &GraphBackend,
     label_name: &str,
     property: &str,
 ) -> Result<(), CirroError> {
@@ -499,7 +487,7 @@ async fn create_index(
         label_name, property, label_name, property
     );
     debug!("Executing query: {}", index_query);
-    graph.run(query(&index_query)).await.map_err(|e| {
+    graph.run(&index_query, Map::new()).await.map_err(|e| {
         CirroError::DatabaseError(format!(
             "Failed to create index for {}.{}: {}",
             label_name, property, e
@@ -510,7 +498,7 @@ async fn create_index(
 
 /// Create a uniqueness constraint for a label's property (idempotent via IF NOT EXISTS)
 async fn create_constraint(
-    graph: &neo4rs::Graph,
+    graph: &GraphBackend,
     label_name: &str,
     property: &str,
 ) -> Result<(), CirroError> {
@@ -518,11 +506,14 @@ async fn create_constraint(
         .replacen("{}", label_name, 1)
         .replacen("{}", property, 1);
     debug!("Executing query: {}", constraint_query);
-    graph.run(query(&constraint_query)).await.map_err(|e| {
-        CirroError::DatabaseError(format!(
-            "Failed to create constraint for {}.{}: {}",
-            label_name, property, e
-        ))
-    })?;
+    graph
+        .run(&constraint_query, Map::new())
+        .await
+        .map_err(|e| {
+            CirroError::DatabaseError(format!(
+                "Failed to create constraint for {}.{}: {}",
+                label_name, property, e
+            ))
+        })?;
     Ok(())
 }

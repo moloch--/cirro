@@ -52,6 +52,7 @@ nav = [
     { "Quick Start" = "usage/quick-start.md" },
     { "Collection" = "usage/cirro.md" },
     { "Graph Operations" = "usage/cirro-graph.md" },
+    { "GraphQLite Backend" = "usage/graphqlite.md" },
   ] },
   { "Analysis" = [
     { "Overview" = "analysis/cirro-graph-analysis.md" },

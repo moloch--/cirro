@@ -52,7 +52,18 @@ _|"""""|_|"""""|_|"""""|_|"""""|_|"""""|
 "`-0-0-'"`-0-0-'"`-0-0-'"`-0-0-'"`-0-0-' 
         "#;
 
-    println!("{}", logo.blue().bold());
+    #[cfg(feature = "graph")]
+    let json_output = matches!(
+        &command,
+        Some(Commands::Graph {
+            command: GraphCommands::Query { .. }
+        })
+    );
+    #[cfg(not(feature = "graph"))]
+    let json_output = false;
+    if !json_output {
+        println!("{}", logo.blue().bold());
+    }
 
     match command {
         #[cfg(feature = "collector")]

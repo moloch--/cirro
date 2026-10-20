@@ -86,7 +86,11 @@ The binary will be available at `target/release/cirro`.
 
 #### Build Options
 
-By default, Cirro includes all available functionality. To build with specific features:
+By default, Cirro includes Azure and Tailscale collection plus the Neo4j backend.
+This fork also supports an optional embedded GraphQLite backend. Build it with
+`tools/build-graphqlite.sh`; see the [GraphQLite guide](docs/usage/graphqlite.md)
+for local graph ingestion, Cypher queries, export and compatibility checks.
+To build with specific features:
 
 ```bash
 # Build with only collection features

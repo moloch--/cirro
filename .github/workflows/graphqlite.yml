@@ -1,0 +1,86 @@
+name: GraphQLite backend
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: graphqlite-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native GraphQLite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            extension: so
+          - os: macos-latest
+            extension: dylib
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+      CIRRO_GRAPHQLITE_EXTENSION: ${{ github.workspace }}/target/graphqlite/source/build/graphqlite.${{ matrix.extension }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Linux'
+        with:
+          python-version: '3.12'
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex sqlite3 libsqlite3-dev libcunit1-dev pkg-config libssl-dev cmake
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install bison flex sqlite cunit python@3.14
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
+          # Homebrew Python enables SQLite extension loading on macOS.
+          echo "$(brew --prefix python@3.14)/libexec/bin" >> "$GITHUB_PATH"
+          echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
+          echo "SQLITE_PREFIX=$(brew --prefix sqlite)" >> "$GITHUB_ENV"
+      - name: Install native build tooling
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install angreal==2.9.2
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          .venv/bin/python -c "import sqlite3; db = sqlite3.connect(':memory:'); db.enable_load_extension(True); print('SQLite', sqlite3.sqlite_version)"
+      - name: Test existing default features
+        run: cargo test --locked
+      - name: Build pinned extension and optional CLI
+        run: tools/build-graphqlite.sh --locked
+      - name: Test optional GraphQLite feature
+        run: cargo test --locked --features graphqlite
+      - name: Verify ingestion, queries and exports through the CLI
+        run: |
+          python tools/test_graphqlite_e2e.py \
+            --binary target/release/cirro \
+            --pagination-rows 2501 \
+            --work-dir target/graphqlite-e2e
+      - name: Upload synthetic end-to-end reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphqlite-e2e-${{ matrix.os }}
+          if-no-files-found: ignore
+          path: |
+            target/graphqlite-e2e/report.json
+            target/graphqlite-e2e/command-*.log

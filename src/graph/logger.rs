@@ -1,13 +1,21 @@
 use colored::Colorize;
 
 pub fn setup_logger(verbose: bool) -> Result<(), fern::InitError> {
+    setup_output(verbose, false)
+}
+
+pub fn setup_query_logger(verbose: bool) -> Result<(), fern::InitError> {
+    setup_output(verbose, true)
+}
+
+fn setup_output(verbose: bool, stderr: bool) -> Result<(), fern::InitError> {
     let level = if verbose {
         log::LevelFilter::Debug
     } else {
         log::LevelFilter::Info
     };
 
-    let _ = fern::Dispatch::new()
+    let dispatch = fern::Dispatch::new()
         .format(move |out, message, record| {
             let level_str = match record.level() {
                 log::Level::Error => "[E]".red().bold(),
@@ -30,9 +38,12 @@ pub fn setup_logger(verbose: bool) -> Result<(), fern::InitError> {
             } else {
                 true // Allow everything else
             }
-        })
-        .chain(std::io::stdout())
-        .apply()?;
+        });
+    if stderr {
+        dispatch.chain(std::io::stderr()).apply()?;
+    } else {
+        dispatch.chain(std::io::stdout()).apply()?;
+    }
 
     Ok(())
 }
