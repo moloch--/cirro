@@ -190,7 +190,7 @@ jobs:
               export CIRRO_GRAPHQLITE_EXTENSION=/work/target/release-extension/graphqlite.so
               # A static musl executable cannot load a SQLite extension with dlopen.
               # Rust explicitly links -lgcc_s when libc is dynamic. Resolve that
-              # name to GCC's static unwind archive so bare Alpine needs only musl.
+              # name to the GCC static unwind archive so bare Alpine needs only musl.
               mkdir -p /work/target/musl-unwind
               cp "$(gcc -print-file-name=libgcc_eh.a)" /work/target/musl-unwind/libgcc_s.a
               export RUSTFLAGS="-C target-feature=-crt-static -L native=/work/target/musl-unwind"
