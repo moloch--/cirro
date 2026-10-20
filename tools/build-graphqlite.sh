@@ -30,6 +30,11 @@ if [[ "$TARGET" == *-windows-msvc ]]; then
 fi
 if [[ "$TARGET" == *-linux-musl ]]; then
     # SQLite needs the dynamic loader to open the bundled extension.
-    export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static"
+    # Resolve Rust's explicit -lgcc_s to static unwind support, without making
+    # libc static or requiring an extra libgcc_s.so.1 installation at runtime.
+    mkdir -p "$BUILD_ROOT/musl-unwind"
+    UNWIND_DIR=$(cd "$BUILD_ROOT/musl-unwind" && pwd)
+    cp "$(gcc -print-file-name=libgcc_eh.a)" "$UNWIND_DIR/libgcc_s.a"
+    export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static -L native=$UNWIND_DIR"
 fi
 cargo build --manifest-path "$ROOT/Cargo.toml" --release --features graphqlite "$@"

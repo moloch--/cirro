@@ -9,6 +9,19 @@ on:
         type: string
         default: '{}'
   workflow_dispatch:
+    inputs:
+      target:
+        description: Target to validate (releases always build all targets)
+        type: choice
+        default: all
+        options:
+          - all
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - x86_64-pc-windows-msvc
 
 permissions:
   contents: read
@@ -29,6 +42,8 @@ jobs:
         run: python -m unittest discover -s tools -p 'test_graphqlite_release_unit.py'
       - id: targets
         shell: python
+        env:
+          SELECTED_TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'all' }}
         run: |
           import json, os, tomllib
           matrix = [
@@ -42,6 +57,10 @@ jobs:
           with open("dist-workspace.toml", "rb") as source:
               targets = tomllib.load(source)["dist"]["targets"]
           assert sorted(targets) == sorted(row["target"] for row in matrix), "Release target matrices differ"
+          selected = os.environ["SELECTED_TARGET"]
+          if selected != "all":
+              matrix = [row for row in matrix if row["target"] == selected]
+              assert len(matrix) == 1, "Unknown release target"
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write("matrix=" + json.dumps({"include": matrix}) + "\n")
       - uses: actions/upload-artifact@v4
@@ -170,7 +189,11 @@ jobs:
                 --output /work/target/release-extension/graphqlite.so
               export CIRRO_GRAPHQLITE_EXTENSION=/work/target/release-extension/graphqlite.so
               # A static musl executable cannot load a SQLite extension with dlopen.
-              export RUSTFLAGS="-C target-feature=-crt-static"
+              # Rust explicitly links -lgcc_s when libc is dynamic. Resolve that
+              # name to GCC's static unwind archive so bare Alpine needs only musl.
+              mkdir -p /work/target/musl-unwind
+              cp "$(gcc -print-file-name=libgcc_eh.a)" /work/target/musl-unwind/libgcc_s.a
+              export RUSTFLAGS="-C target-feature=-crt-static -L native=/work/target/musl-unwind"
               cargo build --locked --profile dist --features graphqlite --target x86_64-unknown-linux-musl
               python3 tools/package-graphqlite-release.py \
                 --target x86_64-unknown-linux-musl \

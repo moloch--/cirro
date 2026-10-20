@@ -32,7 +32,8 @@ that permits loading shared libraries.
 The release workflow tests each downloaded archive on a fresh runner, with
 no checkout or GraphQLite installation, before allowing release publication.
 The **GraphQLite release packages** workflow can also be run manually to build
-and validate archives without creating a tag or publishing a release.
+and validate all archives or one selected target without creating a tag or
+publishing a release. Tagged releases always build and verify all six targets.
 
 ## Build
 
