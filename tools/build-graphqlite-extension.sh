@@ -19,6 +19,8 @@ Requires git, gcc, make, Bison, Flex, Python and angreal 2.9.2. If angreal
 is absent, a private Python virtual environment is created. Linux also needs
 binutils; Windows needs the MinGW SQLite, libsystre/TRE, gettext and iconv
 static libraries. macOS needs the current Homebrew Bison.
+Windows also needs autotools, gettext build tools, curl and patch to rebuild
+TRE without localization; gettext/iconv are then excluded from the DLL.
 
 --env-file appends CIRRO_GRAPHQLITE_EXTENSION for a GitHub Actions environment
 file. Build logs go to stdout; use the explicit output path, not stdout parsing.
@@ -116,6 +118,16 @@ esac
 
 mkdir -p "$BUILD_ROOT"
 BUILD_ROOT=$(cd "$BUILD_ROOT" && pwd)
+if [[ "$PLATFORM" == windows ]]; then
+    need nm
+    "$ROOT/tools/build-windows-tre.sh" "$BUILD_ROOT/windows-tre"
+    # MinGW's native GCC uses semicolons to separate Windows library paths.
+    TRE_LIBRARY_PATH=$(cygpath -m "$BUILD_ROOT/windows-tre/lib")
+    export LIBRARY_PATH="$TRE_LIBRARY_PATH${LIBRARY_PATH:+;$LIBRARY_PATH}"
+    RESOLVED_TRE=$(gcc -print-file-name=libtre.a)
+    [[ "$(cygpath -u "$RESOLVED_TRE")" -ef "$BUILD_ROOT/windows-tre/lib/libtre.a" ]] ||
+        fail "MinGW did not select the private no-NLS TRE archive: $RESOLVED_TRE"
+fi
 SOURCE="$BUILD_ROOT/source"
 if [[ ! -d "$SOURCE/.git" ]]; then
     [[ ! -e "$SOURCE" ]] || fail "Source path exists without a Git checkout: $SOURCE"
@@ -183,6 +195,12 @@ case "$PLATFORM" in
                 *) fail "Non-system Windows DLL dependency: $dependency" ;;
             esac
         done < <(objdump -p "$BUILT" | awk '/DLL Name:/ {print tolower($3)}')
+        # The original Makefile names -lintl/-liconv, but our no-NLS TRE must
+        # leave those archives unused. Inspect all linked symbols, not imports.
+        WINDOWS_SYMBOLS=$(nm "$BUILT")
+        if grep -Ei 'libintl_|libiconv|[[:space:]]_?(gettext|dgettext|dcgettext)$' <<< "$WINDOWS_SYMBOLS"; then
+            fail "Windows extension contains an unexpected gettext/iconv implementation"
+        fi
         ;;
 esac
 

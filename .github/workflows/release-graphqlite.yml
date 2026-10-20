@@ -97,9 +97,13 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-sqlite3
             mingw-w64-x86_64-libsystre
+            mingw-w64-x86_64-autotools
+            mingw-w64-x86_64-gettext-tools
             bison
             flex
             make
+            patch
+            curl
       - uses: ilammy/setup-nasm@v1
         if: runner.os == 'Windows'
       - name: Build native extension
@@ -119,7 +123,6 @@ jobs:
           # Retain notices for the statically linked MinGW dependencies.
           mkdir -p target/release-notices
           for package in mingw-w64-x86_64-libsystre mingw-w64-x86_64-libtre \
-            mingw-w64-x86_64-gettext-runtime mingw-w64-x86_64-libiconv \
             mingw-w64-x86_64-gcc-libs mingw-w64-x86_64-sqlite3; do
             while IFS= read -r notice; do
               if [[ -f "$notice" ]]; then
@@ -129,6 +132,9 @@ jobs:
               fi
             done < <(pacman -Ql "$package" | awk '$2 ~ /\/share\/licenses\// {print $2}')
           done
+          mkdir -p target/release-notices/libtre
+          cp target/graphqlite/windows-tre/share/licenses/libtre/LICENSE target/release-notices/libtre/
+          cp target/graphqlite/windows-tre/BUILD-SOURCE.txt target/release-notices/libtre/
       - name: Build GraphQLite CLI
         if: ${{ !endsWith(matrix.target, '-musl') }}
         run: |
