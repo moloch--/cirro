@@ -30,6 +30,10 @@ impl BundledExtension {
             directory.path().join("LICENSE"),
             include_bytes!("../../third_party/graphqlite-LICENSE"),
         )?;
+        fs::write(
+            directory.path().join("LICENSE-PCRE2"),
+            include_bytes!("../../third_party/pcre2-LICENSE"),
+        )?;
         Ok(Self {
             path,
             _directory: directory,

@@ -14,9 +14,9 @@ features plus GraphQLite. The extension is embedded in the executable; there is
 no separate extension installation or database server to configure. Neo4j
 remains the default backend, so select `--backend graphqlite` for local graphs.
 
-The archives include both licenses, a SHA-256 checksum alongside the download,
-and `build-info.json` recording the Cirro and GraphQLite revisions and binary
-and embedded-extension hashes. The original `cirro-<target>` packages and their
+The archives include Cirro, GraphQLite and PCRE2 licenses, a SHA-256 checksum
+alongside the download, and `build-info.json` recording the Cirro and GraphQLite
+revisions and binary and embedded-extension hashes. The original `cirro-<target>` packages and their
 installers continue to provide the default-feature build.
 
 GraphQLite packages cover the same six release targets: macOS Intel and Apple
@@ -37,16 +37,18 @@ publishing a release. Tagged releases always build and verify all six targets.
 
 ## Build
 
-The build helper fetches the pinned GraphQLite fork, builds its native extension,
-and embeds it in the Cirro binary:
+The build helper reads the GraphQLite revision from `Cargo.toml`, fetches that
+exact commit, builds its native extension, and embeds it in the Cirro binary.
+The current pin is
+[`cc044d4b71f6801c23ba69a801a274dfcdc78a2c`](https://github.com/moloch--/graphqlite/commit/cc044d4b71f6801c23ba69a801a274dfcdc78a2c).
 
 ```sh
-tools/build-graphqlite.sh
+tools/build-graphqlite.sh --locked
 ```
 
-This requires Rust, Git, Python, a C compiler, Bison and Flex. On macOS, install
-Homebrew Bison and Flex; the helper puts Homebrew Bison on the build path. The
-helper creates an isolated Python environment for `angreal` when needed.
+This requires Rust, Git, Python 3.11 or newer, Make, a C compiler, Bison and Flex.
+On macOS, install Homebrew Bison and Flex; the helper adds them to the build path.
+The extension is built directly with the pinned fork's Makefile.
 
 If the pinned native extension is already built, use it directly:
 
@@ -64,10 +66,17 @@ embedded library for development.
 The fork implements the Cypher constructs and APOC subset used by Cirro's
 templates. It is not a complete Neo4j or APOC implementation. In particular,
 `apoc.periodic.iterate` runs sequentially in one atomic SQLite transaction, even
-when a template requests parallel batches. Its regular expression helpers use
-POSIX expressions. See the
-[fork's compatibility reference](https://github.com/moloch--/graphqlite/blob/b59a6dab054cb75a71d500a7a243f3fd399c8eec/docs/src/content/docs/reference/apoc-compatibility.md)
+when a template requests parallel batches. Cypher's `=~` operator uses bundled
+PCRE2 with whole-string matching and inline flags such as `(?i)`; APOC regular
+expression helpers still use POSIX expressions. See the
+[fork's compatibility reference](https://github.com/moloch--/graphqlite/blob/cc044d4b71f6801c23ba69a801a274dfcdc78a2c/docs/src/content/docs/reference/apoc-compatibility.md)
 for the supported subset.
+
+At this revision, accessing a resource's `id` property inside a `nodes(path)`
+list comprehension (for example, `[n IN nodes(p) | n.id]`) returns internal node
+IDs instead. Query the `id` property on a directly bound node, such as
+`MATCH (n) RETURN n.id`, when resource identity matters. The end-to-end report
+records this known query limitation separately from import/export parity.
 
 ## Import, query and export
 
@@ -107,6 +116,11 @@ cirro graph query --backend graphqlite --graph-file analysis.db \
   --cypher 'MATCH (t:TSUser)-[:SAME_USER]->(u:GraphUser) RETURN t.loginName AS tailscale, u.userPrincipalName AS azure'
 ```
 
+Ingestion creates the graph file if needed. Queries and exports require an
+existing file so a mistyped path cannot silently create an empty graph. To start
+a graph directly with Cypher, create an empty file first (`touch analysis.db` on
+Unix, or `New-Item analysis.db` in PowerShell).
+
 Both existing export formats are available:
 
 ```sh
@@ -139,12 +153,16 @@ and last users; it is a correctness check, not a performance benchmark.
 It uses a fresh temporary directory and prints the path to `report.json`.
 The directory retains source fixtures, output graphs, exports and command logs
 for inspection. The report contains source schemas and counts, hashes, executed
-queries and check names. It does not include query-result property values.
+queries and check names. Supplied collection reports omit query-result property
+values; synthetic compatibility diagnostics include expected and actual fixture
+values under `known_limitations`.
 
 Checks cover user/group membership, manager direction, Tailscale identity links,
 nested network relationships, dynamic role types and properties, serialized VM
 settings, vault version parents, node and edge deduplication, label filtering,
-file persistence, repeated-import idempotence and dry-run behavior. They also
+file persistence, repeated-import idempotence and dry-run behavior. Query checks
+cover whole-string regular expressions, scoped `CALL UNION` result growth and
+types, named paths and optional relationship lists. They also
 check that ingestion cannot use its source as the graph, and that exporting
 cannot overwrite the graph, including through hardlinks and symbolic links.
 Source hashes must remain unchanged throughout the run.

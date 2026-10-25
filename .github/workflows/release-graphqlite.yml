@@ -99,7 +99,7 @@ jobs:
         if: runner.os == 'Linux' && !endsWith(matrix.target, '-musl')
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential bison flex binutils python3-venv pkg-config libssl-dev cmake
+          sudo apt-get install -y build-essential bison flex binutils pkg-config libssl-dev cmake
       - name: Install macOS build dependencies
         if: runner.os == 'macOS'
         run: |
@@ -183,7 +183,7 @@ jobs:
           docker run --rm -v "$PWD:/work" -w /work \
             -e CARGO_TARGET_DIR=/work/target/alpine \
             rust:1.94-alpine3.23 sh -euxc '
-              apk add --no-cache bash build-base bison flex python3 py3-pip python3-dev git binutils cmake perl linux-headers openssl-dev openssl-libs-static pkgconf
+              apk add --no-cache bash build-base bison flex python3 git binutils cmake perl linux-headers openssl-dev openssl-libs-static pkgconf
               git config --global --add safe.directory /work
               bash tools/build-graphqlite-extension.sh --target x86_64-unknown-linux-musl \
                 --output /work/target/release-extension/graphqlite.so

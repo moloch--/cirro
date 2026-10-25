@@ -31,7 +31,7 @@ import zipfile
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 NATIVE_SUFFIXES = (".so", ".dylib", ".dll")
-PACKAGE_FILES = ("README.md", "LICENSE", "graphqlite-LICENSE", "build-info.json")
+PACKAGE_FILES = ("README.md", "LICENSE", "graphqlite-LICENSE", "pcre2-LICENSE", "build-info.json")
 REQUIRED_FEATURES = {"azure", "tailscale", "graph", "graphqlite"}
 
 

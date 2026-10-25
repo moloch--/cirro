@@ -2,6 +2,12 @@
 
 Cirro's graph functionality manages data ingestion into graph databases and data export operations.
 
+Choose external Neo4j (the default) or standalone GraphQLite with
+`--backend graphqlite --graph-file analysis.db`. GraphQLite requires a binary
+built with `tools/build-graphqlite.sh --locked`, or a `cirro-graphqlite` release
+package. It stores the graph locally and embeds the native extension. See the
+[standalone guide](graphqlite.md) for setup, query examples and compatibility.
+
 ## Command Structure
 
 ```bash
@@ -10,7 +16,7 @@ cirro graph <command> [options]
 
 ## Data Ingestion
 
-Ingest collected data into Neo4j:
+Ingest collected data into the selected graph backend:
 
 ```bash
 cirro graph ingest --type <platform> --file <data-file> [options]
@@ -18,8 +24,10 @@ cirro graph ingest --type <platform> --file <data-file> [options]
 
 ### Options
 
-- `--type`, `-t`: Platform type (`az` for Azure, `ts` for Tailscale)
+- `--type`, `-t`: Platform type (`az` for Azure, `ts-status` for Tailscale status JSON)
 - `--file`, `-f`: Path to the collected data file for the selected platform
+- `--backend`: Graph backend (`neo4j` by default; `graphqlite` in standalone builds)
+- `--graph-file`: Local graph file for GraphQLite, separate from the collected input; created during ingestion
 - `--server`, `-s`: Database server URL (default: `bolt://localhost:7687`)
 - `--user`, `-u`: Database username (default: `neo4j`)
 - `--password`, `-p`: Database password (default: `password`)
@@ -42,6 +50,10 @@ cirro graph ingest --type <platform> --file <data-file> [options]
 # Ingest Azure data with defaults
 cirro graph ingest --type az --file cirro_output.db
 
+# Ingest Azure data without a database server
+cirro graph ingest --backend graphqlite --graph-file analysis.db \
+  --type az --file cirro_output.db
+
 # Ingest to custom database
 cirro graph ingest \
   --type az \
@@ -52,7 +64,7 @@ cirro graph ingest \
   --db-name azure-prod
 
 # Ingest Tailscale data with debug logging
-cirro graph ingest --type ts --file cirro_ts_socket.json --debug
+cirro graph ingest --type ts-status --file tailscale-status.json --debug
 
 # Use encrypted connection
 cirro graph ingest \
@@ -64,7 +76,7 @@ cirro graph ingest \
 cirro graph ingest --type az --file cirro_output.db --dry-run
 
 # Dry-run: preview Tailscale ingestion
-cirro graph ingest --type ts --file cirro_ts_socket.json --dry-run
+cirro graph ingest --type ts-status --file tailscale-status.json --dry-run
 ```
 
 ### Dry-Run Mode
@@ -75,7 +87,7 @@ This is useful for validating a data file or auditing spec coverage before a ful
 When `--dry-run` is specified, Cirro will:
 
 - Log each spec and the number of rows that **would** be processed
-- Skip all Neo4j writes (no ingest or post-processing queries are executed)
+- Skip all graph writes (no ingest or post-processing queries are executed)
 - Skip transaction finalization
 - Print the list of post-processing specs that would run, in priority order
 - **Azure only**: compare the resource types present in the input data against all implemented specs and report any resource types that have no spec (i.e., would be silently skipped during a real ingest)
@@ -96,8 +108,10 @@ cirro graph export --format <format> [options]
 
 ### Options
 
-- `--format`, `-f`: Export format (`opengraph`)
+- `--format`, `-f`: Export format (`opengraph` or `grass`)
 - `--output`, `-o`: Output file path (default: `cirro_export`)
+- `--backend`: Graph backend (`neo4j` by default; `graphqlite` in standalone builds)
+- `--graph-file`: Existing local graph file for GraphQLite
 - `--server`, `-s`: Database server URL (default: `bolt://localhost:7687`)
 - `--user`, `-u`: Database username (default: `neo4j`)
 - `--password`, `-p`: Database password (default: `password`)
@@ -109,6 +123,10 @@ cirro graph export --format <format> [options]
 ```bash
 # Export to OpenGraph format
 cirro graph export --format opengraph --output my-export.json
+
+# Export a standalone graph
+cirro graph export --backend graphqlite --graph-file analysis.db \
+  --format opengraph --output my-export.json
 
 # Export from custom database
 cirro graph export \

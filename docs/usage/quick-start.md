@@ -3,14 +3,21 @@
 !!! tip "Prerequisites"
 
     - Valid cloud platform credentials (currently Azure)
-    - Running Neo4j instance
+    - A GraphQLite-enabled Cirro binary for standalone use, or a running Neo4j instance
     - Appropriate permissions for target cloud environment
 
 !!! warning
 
-    - Neo4j requires [APOC plugin](https://neo4j.com/docs/apoc/current/)
+    - The external Neo4j backend requires the [APOC plugin](https://neo4j.com/docs/apoc/current/).
   
 ## Install Cirro
+
+For standalone use, build this fork with `tools/build-graphqlite.sh --locked`,
+or select a `cirro-graphqlite-<target>` package from the
+[fork's releases](https://github.com/moloch--/cirro/releases). The binary supports
+both backends and includes its GraphQLite extension. See the
+[GraphQLite guide](graphqlite.md) for build prerequisites and platform details.
+The upstream installers below provide the Neo4j build.
 
 === "Shell Script (Unix/Linux/macOS)"
 
@@ -43,17 +50,32 @@ cirro collect az client-secret \
 
 ## Ingest into Graph Database
 
-Neo4j is supported as the graph database backend. Set up your database before ingesting cloud data. There is a docker-compose file in the [tools](https://github.com/bishopfox/cirro/tools) directory to assist with containerized database setup.
+For standalone use, ingest into a local graph file separate from the collection:
+
+```bash
+cirro graph ingest --backend graphqlite --graph-file analysis.db \
+  --type az --file cirro_output.db
+
+cirro graph query --backend graphqlite --graph-file analysis.db \
+  --cypher 'MATCH (n) RETURN count(n) AS nodes'
+
+cirro graph export --backend graphqlite --graph-file analysis.db \
+  --format opengraph --output graph.json
+```
+
+For external Neo4j, set up the server before ingesting. The
+[tools Compose file](https://github.com/moloch--/cirro/blob/main/tools/docker-compose.yml)
+starts a database with APOC:
 
 ```bash
 # For Neo4j
-docker-compose up
+docker compose -f tools/docker-compose.yml up -d
 ```
 
 ```bash
 # For Neo4j
-cirro graph ingest --type az --file cirro_output.db \
-    --server bolt://localhost:7687 \
+cirro graph ingest --backend neo4j --type az --file cirro_output.db \
+  --server bolt://localhost:7688 \
   --user neo4j \
   --password password
 ```

@@ -12,6 +12,7 @@ You can check out the [Documentation](https://bishopfox.github.io/cirro) for mor
 - **Cross-platform**: Available for Windows, macOS, and Linux
 - **Modular Design**: Optional platform functionality through feature flags and extensible plugin architecture
 - **Network Topology Analysis**: Support for network infrastructure platforms like Tailscale
+- **Standalone Graphs**: Store and query graphs in a local SQLite file using the optional embedded GraphQLite backend, or connect to an external Neo4j database
 
 ## Architecture
 
@@ -70,12 +71,15 @@ cirro graph export --format <format> [options]
 
 ### Pre-built Binaries
 
-Download the latest release for your platform from the [releases page](https://github.com/bishopfox/cirro/releases). The releases are built with all features enabled.
+The [fork's releases](https://github.com/moloch--/cirro/releases) provide standard
+`cirro-<target>` packages for Neo4j and `cirro-graphqlite-<target>` packages with
+both Neo4j and the standalone backend. GraphQLite packages embed the native
+extension; local graphs need no database server or separate extension installation.
 
 ### Building from Source
 
 ```bash
-git clone https://github.com/bishopfox/cirro.git
+git clone https://github.com/moloch--/cirro.git
 cd cirro
 cargo build --release
 ```
@@ -104,16 +108,39 @@ cargo build --release --no-default-features --features "azure"
 cargo build --release --no-default-features --features "tailscale"
 ```
 
+#### Standalone Quick Start
+
+Build a binary with both database backends, then import collected data into a
+separate local graph file:
+
+```bash
+tools/build-graphqlite.sh --locked
+
+target/release/cirro graph ingest --backend graphqlite --graph-file analysis.db \
+  --type az --file cirro_output.db
+
+target/release/cirro graph query --backend graphqlite --graph-file analysis.db \
+  --cypher 'MATCH (n) RETURN count(n) AS nodes'
+
+target/release/cirro graph export --backend graphqlite --graph-file analysis.db \
+  --format opengraph --output graph.json
+```
+
+The same binary supports `--backend neo4j` with `--server`, `--user`, and
+`--password`. Neo4j remains the default when `--backend` is omitted.
+
 ## Data Ingestion
 
-Cirro uses Neo4j as the backend database. There are docker-compose files in the [tools](/tools/) directory to assist with containerized databases. 
+Cirro supports external Neo4j and local GraphQLite databases. For Neo4j, the
+Docker Compose file in [tools](tools/) can start a database server. For standalone
+use, select `--backend graphqlite --graph-file analysis.db` with a GraphQLite build.
 
 After collecting data, ingest it into your graph database:
 
 ```bash
 # Ingest data for specific platforms
 cirro graph ingest --type az --file cirro_output.db         # Azure data
-cirro graph ingest --type ts --file cirro_ts_socket.json    # Tailscale data
+cirro graph ingest --type ts-status --file tailscale-status.json    # Tailscale data
 
 # Specify custom database connection
 cirro graph ingest --type az --file cirro_output.db \
@@ -131,13 +158,13 @@ Preview what would be ingested and post-processed without writing any data to th
 cirro graph ingest --type az --file cirro_output.db --dry-run
 
 # Preview Tailscale ingestion
-cirro graph ingest --type ts --file cirro_ts_socket.json --dry-run
+cirro graph ingest --type ts-status --file tailscale-status.json --dry-run
 ```
 
 In dry-run mode, Cirro will:
 
 - Report each spec and its row count that **would** be processed
-- Skip all Neo4j writes (no ingestion or post-processing queries execute)
+- Skip all graph writes (no ingestion or post-processing queries execute)
 - For Azure, list resource types in the input data that have no implemented spec
 
 ## Dashboard

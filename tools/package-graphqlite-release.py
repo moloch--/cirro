@@ -20,6 +20,19 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def verify_extension(extension_path: Path, extension: bytes, revision: str, target: str) -> None:
+    """Bind package provenance to the native build, not just the Cargo manifest."""
+    metadata_path = Path(str(extension_path) + ".build-info.json")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"missing or invalid {metadata_path}; rebuild with tools/build-graphqlite-extension.sh") from error
+    expected = {"graphqlite_revision": revision, "target": target,
+                "extension_sha256": sha256(extension)}
+    if not isinstance(metadata, dict) or any(metadata.get(key) != value for key, value in expected.items()):
+        raise ValueError("native extension revision, target or checksum differs from the requested package")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -36,6 +49,10 @@ def main() -> None:
     extension = args.extension.read_bytes()
     if not extension or extension not in binary:
         parser.error("binary does not contain the supplied native extension")
+    try:
+        verify_extension(args.extension, extension, cargo["dependencies"]["graphqlite"]["rev"], args.target)
+    except ValueError as error:
+        parser.error(str(error))
     windows = args.target.endswith("windows-msvc")
     basename = f"cirro-graphqlite-{args.target}"
     output = args.output_dir.resolve()
@@ -51,6 +68,7 @@ def main() -> None:
         executable.chmod(0o755)
         shutil.copy2(ROOT / "LICENSE", package / "LICENSE")
         shutil.copy2(ROOT / "third_party/graphqlite-LICENSE", package / "graphqlite-LICENSE")
+        shutil.copy2(ROOT / "third_party/pcre2-LICENSE", package / "pcre2-LICENSE")
         if args.notices_dir:
             shutil.copytree(args.notices_dir, package / "third-party-licenses")
         metadata = {

@@ -366,6 +366,7 @@ dependencies = [
  "rsa",
  "rusqlite",
  "rust-embed",
+ "same-file",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -943,7 +944,7 @@ dependencies = [
 [[package]]
 name = "graphqlite"
 version = "0.12.0"
-source = "git+https://github.com/moloch--/graphqlite?rev=b59a6dab054cb75a71d500a7a243f3fd399c8eec#b59a6dab054cb75a71d500a7a243f3fd399c8eec"
+source = "git+https://github.com/moloch--/graphqlite?rev=cc044d4b71f6801c23ba69a801a274dfcdc78a2c#cc044d4b71f6801c23ba69a801a274dfcdc78a2c"
 dependencies = [
  "rusqlite",
  "serde",

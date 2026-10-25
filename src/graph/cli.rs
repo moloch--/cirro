@@ -116,15 +116,7 @@ impl GraphConnectionArgs {
         if self.backend == BackendKind::Graphqlite {
             if let Some(output) = &self.graph_file {
                 if output.exists() {
-                    let mut same = input.canonicalize()? == output.canonicalize()?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::MetadataExt;
-                        let source = std::fs::metadata(input)?;
-                        let target = std::fs::metadata(output)?;
-                        same |= source.dev() == target.dev() && source.ino() == target.ino();
-                    }
-                    if same {
+                    if same_file::is_same_file(input, output)? {
                         return Err(CirroError::Config(
                             "--graph-file must be separate from input and export files".into(),
                         ));
@@ -238,4 +230,79 @@ pub async fn handle_graph_command(command: GraphCommands) -> Result<(), CirroErr
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "graphqlite"))]
+mod tests {
+    use super::*;
+
+    fn connection(graph_file: PathBuf) -> GraphConnectionArgs {
+        GraphConnectionArgs {
+            backend: BackendKind::Graphqlite,
+            server: "bolt://localhost:7687".into(),
+            user: "neo4j".into(),
+            password: "password".into(),
+            db_name: None,
+            graph_file: Some(graph_file),
+            graphqlite_extension: None,
+        }
+    }
+
+    #[test]
+    fn graph_file_rejects_same_path_and_hardlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.db");
+        let hardlink = directory.path().join("alias.db");
+        std::fs::write(&source, b"collected data").unwrap();
+        std::fs::hard_link(&source, &hardlink).unwrap();
+
+        // Covers both ingestion (the graph aliases the input) and export
+        // (the output aliases the graph), including Windows file identities.
+        for (graph, input) in [
+            (&source, &source),
+            (&hardlink, &source),
+            (&source, &hardlink),
+        ] {
+            let error = connection(graph.clone()).check_input(input).unwrap_err();
+            assert!(error.to_string().contains("must be separate"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_file_rejects_symbolic_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.db");
+        let symlink = directory.path().join("alias.db");
+        std::fs::write(&source, b"collected data").unwrap();
+        std::os::unix::fs::symlink(&source, &symlink).unwrap();
+
+        assert!(connection(symlink.clone()).check_input(&source).is_err());
+        assert!(connection(source).check_input(&symlink).is_err());
+    }
+
+    #[test]
+    fn graph_file_allows_distinct_and_missing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.db");
+        let graph = directory.path().join("graph.db");
+        let missing = directory.path().join("missing.db");
+        std::fs::write(&source, b"same contents").unwrap();
+        std::fs::write(&graph, b"same contents").unwrap();
+
+        assert!(connection(graph.clone()).check_input(&source).is_ok());
+        assert!(connection(missing.clone()).check_input(&source).is_ok());
+        assert!(connection(graph).check_input(&missing).is_ok());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn neo4j_does_not_apply_local_graph_alias_checks() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.db");
+        std::fs::write(&source, b"collected data").unwrap();
+        let mut args = connection(source.clone());
+        args.backend = BackendKind::Neo4j;
+        assert!(args.check_input(&source).is_ok());
+    }
 }

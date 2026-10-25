@@ -15,8 +15,7 @@ Supported native targets:
   x86_64-unknown-linux-musl
   x86_64-pc-windows-msvc (build the C DLL in MSYS2 MINGW64/UCRT64)
 
-Requires git, gcc, make, Bison, Flex, Python and angreal 2.9.2. If angreal
-is absent, a private Python virtual environment is created. Linux also needs
+Requires git, gcc, make, Bison, Flex and Python 3.11+. Linux also needs
 binutils; Windows needs the MinGW SQLite, libsystre/TRE, gettext and iconv
 static libraries. macOS needs the current Homebrew Bison.
 Windows also needs autotools, gettext build tools, curl and patch to rebuild
@@ -25,6 +24,8 @@ TRE without localization; gettext/iconv are then excluded from the DLL.
 --env-file appends CIRRO_GRAPHQLITE_EXTENSION for a GitHub Actions environment
 file. Build logs go to stdout; use the explicit output path, not stdout parsing.
 CIRRO_GRAPHQLITE_BUILD_DIR selects the private checkout/build directory.
+The exact fork revision comes from Cargo.toml. OUTPUT.build-info.json records
+the native target, source revision and extension checksum for release packaging.
 The musl extension requires a dynamically linked musl executable; a fully
 static musl executable cannot load it. The musl loader must exist at runtime.
 EOF
@@ -54,7 +55,20 @@ done
 [[ -n "$TARGET" && -n "$OUTPUT" ]] || { usage >&2; exit 1; }
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-REV=b59a6dab054cb75a71d500a7a243f3fd399c8eec
+PYTHON_BIN=${PYTHON:-python3}
+need "$PYTHON_BIN"
+REV=$("$PYTHON_BIN" - "$ROOT/Cargo.toml" <<'PY'
+import re
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as source:
+    revision = tomllib.load(source)["dependencies"]["graphqlite"]["rev"]
+if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+    raise SystemExit("GraphQLite must be pinned to an exact Git revision in Cargo.toml")
+print(revision)
+PY
+)
 BUILD_ROOT=${CIRRO_GRAPHQLITE_BUILD_DIR:-"$ROOT/target/graphqlite"}
 HOST_OS=$(uname -s)
 HOST_ARCH=$(uname -m)
@@ -138,20 +152,16 @@ fi
 git -C "$SOURCE" fetch --depth 1 origin "$REV"
 git -C "$SOURCE" checkout --detach "$REV"
 [[ "$(git -C "$SOURCE" rev-parse HEAD)" == "$REV" ]] || fail "Pinned source verification failed"
+cmp -s "$SOURCE/LICENSE" "$ROOT/third_party/graphqlite-LICENSE" ||
+    fail "Update third_party/graphqlite-LICENSE to match the pinned source"
+cmp -s "$SOURCE/vendor/pcre2/LICENCE.md" "$ROOT/third_party/pcre2-LICENSE" ||
+    fail "Update third_party/pcre2-LICENSE to match the pinned source"
 
-if ! command -v angreal >/dev/null; then
-    if [[ ! -x "$BUILD_ROOT/venv/bin/angreal" && ! -f "$BUILD_ROOT/venv/Scripts/angreal.exe" ]]; then
-        "${PYTHON:-python3}" -m venv "$BUILD_ROOT/venv"
-        if [[ -x "$BUILD_ROOT/venv/bin/python" ]]; then
-            "$BUILD_ROOT/venv/bin/python" -m pip install angreal==2.9.2
-        else
-            "$BUILD_ROOT/venv/Scripts/python.exe" -m pip install angreal==2.9.2
-        fi
-    fi
-    export PATH="$BUILD_ROOT/venv/bin:$BUILD_ROOT/venv/Scripts:$PATH"
-fi
-need angreal
-(cd "$SOURCE" && angreal dev clean && angreal build extension --release)
+# These are the same Make targets as the fork's development command wrappers.
+# Calling them directly avoids installing a Python build frontend and its Rust
+# extension just to invoke the native compiler.
+make -C "$SOURCE" clean
+make -C "$SOURCE" extension RELEASE=1
 BUILT="$SOURCE/build/graphqlite.$EXT"
 [[ -s "$BUILT" ]] || fail "Build did not produce $BUILT"
 
@@ -209,6 +219,20 @@ OUTPUT="$(cd "$(dirname "$OUTPUT")" && pwd)/$(basename "$OUTPUT")"
 if [[ ! "$OUTPUT" -ef "$BUILT" ]]; then
     cp "$BUILT" "$OUTPUT"
 fi
+"$PYTHON_BIN" - "$OUTPUT" "$REV" "$TARGET" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+extension = Path(sys.argv[1])
+metadata = {
+    "graphqlite_revision": sys.argv[2],
+    "target": sys.argv[3],
+    "extension_sha256": hashlib.sha256(extension.read_bytes()).hexdigest(),
+}
+Path(str(extension) + ".build-info.json").write_text(json.dumps(metadata, indent=2) + "\n")
+PY
 if [[ -n "$ENV_FILE" ]]; then
     ENV_OUTPUT=$OUTPUT
     [[ "$PLATFORM" != windows ]] || ENV_OUTPUT=$(cygpath -m "$OUTPUT")
