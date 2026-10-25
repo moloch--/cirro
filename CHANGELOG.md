@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-10-25
+
+### Added
+
+- Standalone GraphQLite packages for all six release targets, with the native
+  extension embedded in Cirro. Select `--backend graphqlite --graph-file PATH`
+  for local graphs; external Neo4j remains available and is still the default.
+- Cypher queries, ingestion, postprocessing, and both OpenGraph and GraSS exports
+  for local graphs, with synthetic end-to-end and Neo4j parity checks.
+- Package checksums and build provenance, plus isolated package verification
+  before release publication.
+
+### Changed
+
+- Pin GraphQLite to fork commit `cc044d4b71f6801c23ba69a801a274dfcdc78a2c`,
+  including its Cypher fixes and bundled PCRE2 regular expression support.
+- Build the native extension directly with Make and include the PCRE2 license
+  in the executable and release archives.
+
+### Fixed
+
+- Prevent local graph input and export paths from aliasing the graph through
+  hardlinks on Windows as well as Unix.
+- Validate native extension revision, target, and checksum during packaging.
+
+### Known Limitations
+
+- In GraphQLite, `[n IN nodes(p) | n.id]` returns internal node IDs rather than
+  resource `id` properties. Directly bound node properties and import/export
+  parity are covered by the validation suite; see the standalone guide.
+
 ## [1.3.0] - 2026-09-22
 
 ### Added
